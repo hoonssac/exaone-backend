@@ -1,0 +1,96 @@
+version: '3.9'
+
+services:
+  # PostgreSQL (앱 데이터: 사용자, 대화 이력, 설정)
+  postgres:
+    image: postgres:16-alpine
+    container_name: exaone_postgres
+    environment:
+      POSTGRES_USER: exaone_user
+      POSTGRES_PASSWORD: exaone_password
+      POSTGRES_DB: exaone_app
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U exaone_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - exaone_network
+
+  # MySQL (제조 데이터: MES/PLC 데이터)
+  mysql:
+    image: mysql:8.0
+    container_name: exaone_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_USER: exaone_user
+      MYSQL_PASSWORD: exaone_password
+      MYSQL_DATABASE: manufacturing
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - exaone_network
+
+  # Redis (캐시)
+  redis:
+    image: redis:7-alpine
+    container_name: exaone_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - exaone_network
+
+  # FastAPI 애플리케이션
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: exaone_fastapi
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgresql://exaone_user:exaone_password@postgres:5432/exaone_app
+      MYSQL_URL: mysql+pymysql://exaone_user:exaone_password@mysql:3306/manufacturing
+      REDIS_URL: redis://redis:6379/0
+      EXAONE_API_KEY: ${EXAONE_API_KEY}
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - exaone_network
+
+volumes:
+  postgres_data:
+  mysql_data:
+  redis_data:
+
+networks:
+  exaone_network:
+    driver: bridge
