@@ -3,7 +3,7 @@ version: '3.9'
 services:
   # PostgreSQL (앱 데이터: 사용자, 대화 이력, 설정)
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: exaone_postgres
     environment:
       POSTGRES_USER: exaone_user
@@ -13,6 +13,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_pgvector.sql:/docker-entrypoint-initdb.d/02_init_pgvector.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U exaone_user"]
       interval: 10s

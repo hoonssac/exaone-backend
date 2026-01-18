@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from app.models.user import User
 from app.models.chat import ChatThread, ChatMessage
 from app.models.prompt import PromptTable, PromptColumn, PromptDict, PromptKnowledge
-from app.db.database import create_all_tables, test_postgres_connection, test_mysql_connection
+from app.db.database import create_all_tables, test_postgres_connection, test_mysql_connection, PostgresSessionLocal
+from app.service.schema_rag_service import SchemaRAGService
 
 # 환경변수 로드
 load_dotenv()
@@ -48,6 +49,16 @@ async def startup_event():
     if postgres_ok:
         # 테이블 생성
         create_all_tables()
+
+        # 스키마 임베딩 초기화 (Schema-based RAG)
+        try:
+            db = PostgresSessionLocal()
+            SchemaRAGService.initialize_schema_embeddings(db)
+            db.close()
+            print("✅ 스키마 임베딩 초기화 완료")
+        except Exception as e:
+            print(f"⚠️ 스키마 임베딩 초기화 오류: {str(e)}")
+
         print("✅ 모든 시작 절차 완료")
     else:
         print("❌ PostgreSQL 연결 실패 - 테이블을 생성할 수 없습니다")

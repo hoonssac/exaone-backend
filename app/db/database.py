@@ -74,6 +74,60 @@ def create_all_tables():
     Base.metadata.create_all(bind=postgres_engine)
     print("✅ PostgreSQL 테이블 생성 완료")
 
+    # message_embeddings 테이블 생성 (RAG용)
+    try:
+        with postgres_engine.connect() as connection:
+            # pgvector 확장
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+            # message_embeddings 테이블
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS message_embeddings (
+                    id SERIAL PRIMARY KEY,
+                    thread_id INT NOT NULL,
+                    message TEXT NOT NULL,
+                    embedding TEXT,
+                    result_data JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+
+            # 인덱스
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_msg_embed_thread ON message_embeddings(thread_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_msg_embed_created ON message_embeddings(created_at DESC)"
+            ))
+
+            # schema_embeddings 테이블 (스키마 기반 RAG)
+            connection.execute(text("""
+                CREATE TABLE IF NOT EXISTS schema_embeddings (
+                    id SERIAL PRIMARY KEY,
+                    schema_type VARCHAR(20),          -- 'table' 또는 'column'
+                    table_id INT,                     -- prompt_table.id
+                    column_id INT,                    -- prompt_column.id
+                    name VARCHAR(255),                -- 테이블/컬럼 이름
+                    description TEXT,                 -- 설명
+                    embedding TEXT,                   -- JSON 배열 (TF-IDF 벡터)
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+
+            # 인덱스
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_schema_embed_type ON schema_embeddings(schema_type)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_schema_embed_table ON schema_embeddings(table_id)"
+            ))
+
+            connection.commit()
+            print("✅ RAG 테이블 생성 완료 (message_embeddings + schema_embeddings)")
+    except Exception as e:
+        print(f"⚠️ RAG 테이블 생성 오류: {str(e)}")
+
 
 # 데이터베이스 연결 테스트
 def test_postgres_connection():

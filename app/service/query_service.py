@@ -22,6 +22,9 @@ from app.schemas.query import QueryRequest, QueryResponse, QueryResultData
 from app.models.chat import ChatThread, ChatMessage
 from app.models.prompt import PromptDict, PromptKnowledge, PromptTable, PromptColumn
 from app.service.exaone_service import ExaoneService, ExaoneAPIService
+from app.service.ollama_exaone_service import OllamaExaoneService
+from app.service.rag_service import RAGService
+from app.service.schema_rag_service import SchemaRAGService
 from app.utils.sql_validator import SQLValidator
 
 
@@ -96,20 +99,71 @@ class QueryService:
             # 4. 프롬프트 지식 베이스 조회
             knowledge_base = QueryService.get_knowledge_base(db_postgres)
 
-            # 5. EXAONE API 호출 (SQL 생성)
-            # 먼저 실제 API 시도, 실패 시 Mock으로 폴백
+            # 5. RAG 컨텍스트 검색 (2가지: Conversation RAG + Schema RAG)
+            rag_context = []
+            schema_hint = ""
+
+            try:
+                # Conversation RAG: 이전 대화 검색
+                rag_context = RAGService.retrieve_context(
+                    db_postgres,
+                    thread_id=thread.id,
+                    query=request.message,
+                    top_k=3
+                )
+                if rag_context:
+                    print(f"✅ Conversation RAG: {len(rag_context)} 개 메시지 검색됨")
+            except Exception as rag_error:
+                print(f"⚠️ Conversation RAG 검색 실패: {str(rag_error)}")
+
+            try:
+                # Schema RAG: 스키마 기반 검색 (테이블/컬럼 자동 매핑)
+                schema_results = SchemaRAGService.search_similar_schema(
+                    db_postgres,
+                    query=request.message,
+                    top_k=5
+                )
+                if schema_results:
+                    schema_hint = SchemaRAGService.format_schema_hint(schema_results)
+                    print(f"✅ Schema RAG: {len(schema_results)} 개 스키마 검색됨")
+                    print(f"   스키마 힌트:\n{schema_hint}")
+            except Exception as schema_rag_error:
+                print(f"⚠️ Schema RAG 검색 실패: {str(schema_rag_error)}")
+
+            # 6. EXAONE AI 호출 (SQL 생성)
+            # 우선 순서: Ollama 로컬 EXAONE → Mock 폴백
             generated_sql = None
             try:
-                print(f"🔄 EXAONE 실제 API 호출 중...")
-                generated_sql = ExaoneAPIService.nl_to_sql_api(
-                    user_query=request.message,
+                print(f"🔄 Ollama 로컬 EXAONE 호출 중...")
+
+                # 통합 프롬프트 구성: Conversation RAG + Schema RAG
+                api_query = request.message
+
+                # Conversation RAG 컨텍스트 추가
+                if rag_context:
+                    rag_prompt = RAGService.build_rag_prompt(
+                        user_query=request.message,
+                        context=rag_context,
+                        schema_info=schema_info
+                    )
+                    api_query = rag_prompt
+
+                # Schema RAG 힌트 추가
+                if schema_hint:
+                    if api_query == request.message:
+                        api_query = schema_hint + "\n질문: " + request.message
+                    else:
+                        api_query = schema_hint + "\n" + api_query
+
+                generated_sql = OllamaExaoneService.nl_to_sql(
+                    user_query=api_query,
                     corrected_query=corrected_message,
                     schema_info=schema_info,
                     knowledge_base=knowledge_base
                 )
-                print(f"✅ 실제 API 사용")
-            except Exception as api_error:
-                print(f"⚠️ 실제 API 실패 ({str(api_error)}), Mock으로 폴백...")
+                print(f"✅ Ollama 로컬 EXAONE 사용")
+            except Exception as ollama_error:
+                print(f"⚠️ Ollama 오류 ({str(ollama_error)}), Mock으로 폴백...")
                 try:
                     generated_sql = ExaoneService.nl_to_sql(
                         user_query=request.message,
@@ -119,9 +173,9 @@ class QueryService:
                     )
                     print(f"✅ Mock 방식 사용")
                 except Exception as mock_error:
-                    raise ValueError(f"SQL 생성 실패 (API: {api_error}, Mock: {mock_error})")
+                    raise ValueError(f"SQL 생성 실패 (Ollama: {ollama_error}, Mock: {mock_error})")
 
-            # 6. SQL 검증
+            # 7. SQL 검증
             is_valid, error_msg = SQLValidator.validate(generated_sql)
             if not is_valid:
                 raise ValueError(f"SQL 검증 실패: {error_msg}")
@@ -129,10 +183,10 @@ class QueryService:
             # SQL 정제 (LIMIT 추가 등)
             sanitized_sql = SQLValidator.sanitize(generated_sql)
 
-            # 7. MySQL에서 쿼리 실행
+            # 8. MySQL에서 쿼리 실행
             result_data = QueryService.execute_query(db_mysql, sanitized_sql)
 
-            # 8. 대화 기록 저장
+            # 9. 대화 기록 저장
             message = ChatMessage(
                 thread_id=thread.id,
                 role="user",
@@ -144,22 +198,45 @@ class QueryService:
             message_id = message.id
 
             # Assistant 응답 메시지 저장
+            result_data_dict = {
+                "columns": result_data.columns,
+                "rows": result_data.rows,
+                "row_count": result_data.row_count
+            }
+
             assistant_message = ChatMessage(
                 thread_id=thread.id,
                 role="assistant",
                 message=f"생산 데이터 조회 결과 {result_data.row_count}행 반환",
                 corrected_msg=corrected_message,
                 gen_sql=sanitized_sql,
-                result_data={
-                    "columns": result_data.columns,
-                    "rows": result_data.rows,
-                    "row_count": result_data.row_count
-                }
+                result_data=result_data_dict
             )
             db_postgres.add(assistant_message)
             db_postgres.commit()
 
-            # 9. 응답 구성
+            # 10. RAG 임베딩 저장 (비동기)
+            try:
+                # 사용자 메시지 임베딩
+                RAGService.store_embedding(
+                    db_postgres,
+                    thread_id=thread.id,
+                    message=request.message
+                )
+
+                # Assistant 응답 임베딩
+                RAGService.store_embedding(
+                    db_postgres,
+                    thread_id=thread.id,
+                    message=f"생산 데이터 조회 결과 {result_data.row_count}행 반환",
+                    result_data=result_data_dict
+                )
+                print(f"✅ RAG 임베딩 저장 완료")
+            except Exception as embedding_error:
+                print(f"⚠️ RAG 임베딩 저장 실패: {str(embedding_error)}")
+                # 임베딩 저장 실패해도 쿼리 결과는 반환
+
+            # 11. 응답 구성
             execution_time = (time.time() - start_time) * 1000  # 밀리초
 
             response = QueryResponse(
