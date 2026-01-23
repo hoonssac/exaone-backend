@@ -69,17 +69,15 @@ class SignupRequest(BaseModel):
     @field_validator('password')
     @classmethod
     def validate_password(cls, v):
-        """비밀번호 유효성 검증: 영문+숫자+특수문자 8자 이상"""
+        """비밀번호 유효성 검증: 영문+숫자 8자 이상 (특수문자 선택)"""
         if len(v) < 8:
             raise ValueError('비밀번호는 최소 8자 이상이어야 합니다')
 
-        has_upper = any(c.isupper() for c in v)
-        has_lower = any(c.islower() for c in v)
+        has_letter = any(c.isalpha() for c in v)
         has_digit = any(c.isdigit() for c in v)
-        has_special = any(not c.isalnum() for c in v)
 
-        if not (has_upper or has_lower) or not has_digit or not has_special:
-            raise ValueError('비밀번호는 영문, 숫자, 특수문자를 포함해야 합니다')
+        if not (has_letter and has_digit):
+            raise ValueError('비밀번호는 영문과 숫자를 포함해야 합니다')
 
         return v
 
@@ -112,17 +110,15 @@ class ChangePasswordRequest(BaseModel):
     @field_validator('new_password')
     @classmethod
     def validate_password(cls, v):
-        """비밀번호 유효성 검증: 영문+숫자+특수문자 8자 이상"""
+        """비밀번호 유효성 검증: 영문+숫자 8자 이상 (특수문자 선택)"""
         if len(v) < 8:
             raise ValueError('비밀번호는 최소 8자 이상이어야 합니다')
 
-        has_upper = any(c.isupper() for c in v)
-        has_lower = any(c.islower() for c in v)
+        has_letter = any(c.isalpha() for c in v)
         has_digit = any(c.isdigit() for c in v)
-        has_special = any(not c.isalnum() for c in v)
 
-        if not (has_upper or has_lower) or not has_digit or not has_special:
-            raise ValueError('비밀번호는 영문, 숫자, 특수문자를 포함해야 합니다')
+        if not (has_letter and has_digit):
+            raise ValueError('비밀번호는 영문과 숫자를 포함해야 합니다')
 
         return v
 

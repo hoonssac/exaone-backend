@@ -61,28 +61,96 @@ services:
     networks:
       - exaone_network
 
+  # Ollama (LLM 서비스)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: exaone_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+    networks:
+      - exaone_network
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[o]llama serve' && echo ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Caddy (리버스 프록시 + 자동 HTTPS)
+  caddy:
+    image: caddy:2-alpine
+    container_name: exaone_caddy
+    ports:
+      - "8443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - fastapi
+    networks:
+      - exaone_network
+    restart: unless-stopped
+
+  # Cloudflare Tunnel
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: exaone_cloudflared
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - caddy
+    networks:
+      - exaone_network
+    restart: unless-stopped
+
   # FastAPI 애플리케이션
   fastapi:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: exaone_fastapi
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
-    ports:
-      - "8080:8080"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload --timeout-keep-alive 300
+    expose:
+      - "8080"
     environment:
       DATABASE_URL: postgresql://exaone_user:exaone_password@postgres:5432/exaone_app
       MYSQL_URL: mysql+pymysql://exaone_user:exaone_password@mysql:3306/manufacturing
       REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: exaone3.5:7.8b
       EXAONE_API_KEY: ${EXAONE_API_KEY}
+      SUPERTONIC_MODEL_PATH: /app/supertonic/assets
+      SUPERTONIC_DEFAULT_SPEAKER: M1
+      SUPERTONIC_INFERENCE_STEPS: 10
     volumes:
       - .:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
       mysql:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      ollama:
         condition: service_healthy
     networks:
       - exaone_network
@@ -91,6 +159,9 @@ volumes:
   postgres_data:
   mysql_data:
   redis_data:
+  ollama_data:
+  caddy_data:
+  caddy_config:
 
 networks:
   exaone_network:

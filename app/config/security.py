@@ -11,8 +11,9 @@ from passlib.context import CryptContext
 # JWT 설정
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-REFRESH_TOKEN_EXPIRE_DAYS = 7
+# 토큰 만료 없음 (매우 긴 시간으로 설정: 365년)
+ACCESS_TOKEN_EXPIRE_MINUTES = 365 * 24 * 60  # 약 1년
+REFRESH_TOKEN_EXPIRE_DAYS = 365 * 365  # 약 365년
 
 # 비밀번호 해싱 설정
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

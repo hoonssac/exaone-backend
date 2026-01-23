@@ -117,6 +117,11 @@ class QueryResponse(BaseModel):
         description="쿼리 실행 시간 (밀리초)",
         example=45.2
     )
+    natural_response: str = Field(
+        ...,
+        description="ChatGPT가 생성한 자연어 응답",
+        example="오늘 총 생산량은 15,280개입니다."
+    )
     created_at: datetime = Field(
         ...,
         description="응답 생성 시간",
@@ -137,6 +142,7 @@ class QueryResponse(BaseModel):
                     "row_count": 1
                 },
                 "execution_time": 45.2,
+                "natural_response": "오늘 총 생산량은 15,280개입니다.",
                 "created_at": "2026-01-14T10:30:00"
             }
         }
@@ -288,5 +294,84 @@ class QueryErrorResponse(BaseModel):
                 "error_code": "SQL_VALIDATION_FAILED",
                 "message": "쿼리 검증에 실패했습니다",
                 "details": "허용되지 않는 키워드: DELETE"
+            }
+        }
+
+
+class TTSRequest(BaseModel):
+    """
+    TTS (Text-to-Speech) API 요청 스키마
+
+    텍스트를 음성(WAV 파일)으로 변환하는 요청입니다.
+    """
+    text: str = Field(
+        ...,
+        description="변환할 텍스트 (최대 500자)",
+        example="오늘 총 생산량은 15,280개입니다.",
+        max_length=500,
+        min_length=1
+    )
+    language: str = Field(
+        default="ko",
+        description="언어 코드 (ko, en, es, pt, fr)",
+        example="ko"
+    )
+    speaker: Optional[str] = Field(
+        None,
+        description="화자 코드 (M1-M5: 남성, F1-F5: 여성), 기본값은 M1",
+        example="M1"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "오늘 총 생산량은 15,280개입니다.",
+                "language": "ko",
+                "speaker": "M1"
+            }
+        }
+
+
+class TTSResponse(BaseModel):
+    """
+    TTS API 응답 스키마
+
+    WAV 파일 바이너리와 메타데이터를 반환합니다.
+    실제 응답은 audio/wav Content-Type으로 바이너리 스트림입니다.
+    """
+    text: str = Field(
+        ...,
+        description="변환된 텍스트",
+        example="오늘 총 생산량은 15,280개입니다."
+    )
+    language: str = Field(
+        ...,
+        description="사용된 언어",
+        example="ko"
+    )
+    speaker: str = Field(
+        ...,
+        description="사용된 화자",
+        example="M1"
+    )
+    audio_size_bytes: int = Field(
+        ...,
+        description="생성된 WAV 파일 크기 (바이트)",
+        example=96000
+    )
+    execution_time: float = Field(
+        ...,
+        description="TTS 변환 실행 시간 (초)",
+        example=0.5
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "오늘 총 생산량은 15,280개입니다.",
+                "language": "ko",
+                "speaker": "M1",
+                "audio_size_bytes": 96000,
+                "execution_time": 0.5
             }
         }

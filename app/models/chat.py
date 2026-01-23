@@ -16,6 +16,7 @@ class ChatThread(Base):
     title = Column(String(255), nullable=True)  # AI가 자동 생성하는 요약
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)  # Soft delete
 
     # 관계
     messages = relationship("ChatMessage", back_populates="thread", cascade="all, delete-orphan")
@@ -40,6 +41,7 @@ class ChatMessage(Base):
     gen_sql = Column(Text, nullable=True)  # 생성된 SQL
     result_data = Column(JSON, nullable=True)  # 쿼리 실행 결과 (JSON)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True, index=True)  # Soft delete
 
     # 관계
     thread = relationship("ChatThread", back_populates="messages")

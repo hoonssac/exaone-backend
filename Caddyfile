@@ -1,0 +1,21 @@
+dxs20.iptime.org:443 {
+    reverse_proxy fastapi:8080
+
+    # 자체 서명 인증서 (내부 CA)
+    # Cloudflare가 클라이언트 <-> Caddy 구간의 HTTPS를 처리하므로
+    # 백엔드는 자체 서명 인증서 사용 가능
+    tls internal
+
+    # 로그 설정
+    log {
+        output stdout
+        format console
+    }
+
+    # 헤더 설정 (프록시 정보 전달)
+    header {
+        X-Real-IP {remote_host}
+        X-Forwarded-Proto {scheme}
+        X-Forwarded-For {remote_host}
+    }
+}

@@ -221,6 +221,107 @@ class SQLValidator:
         return list(set(tables))  # 중복 제거
 
     @staticmethod
+    def fix_group_by_order_by(sql: str) -> str:
+        """
+        GROUP BY, SELECT, ORDER BY의 함수 일관성 맞추기
+
+        MySQL ONLY_FULL_GROUP_BY 규칙에 따라 간단하고 강력하게 처리합니다.
+
+        전략: DATE_FORMAT 같은 복잡한 함수를 DATE()로 단순화
+        - SELECT DATE_FORMAT(...) → SELECT DATE(...)
+        - GROUP BY DATE_FORMAT(...) → GROUP BY DATE(...)
+        - WHERE DATE_FORMAT(...) → WHERE DATE(...)
+
+        Args:
+            sql: 원본 SQL
+
+        Returns:
+            수정된 SQL
+        """
+        if not sql:
+            return sql
+
+        sql_upper = sql.upper()
+
+        # GROUP BY가 없으면 처리할 것 없음
+        if "GROUP BY" not in sql_upper:
+            return sql
+
+        # ==================== 전략: DATE_FORMAT을 DATE로 단순화 ====================
+        # DATE_FORMAT(col, format) → DATE(col)
+        # 이렇게 하면 SELECT, GROUP BY, WHERE가 모두 일관되게 됨
+
+        if "DATE_FORMAT" in sql_upper:
+            # DATE_FORMAT(production_date, '%Y-%m-%d') → DATE(production_date)
+            sql = re.sub(
+                r'DATE_FORMAT\s*\(\s*([^,]+?)\s*,\s*[\'"][^\'"]*[\'"]\s*\)',
+                r'DATE(\1)',
+                sql,
+                flags=re.IGNORECASE
+            )
+            print(f"✏️ DATE_FORMAT을 DATE로 단순화: 복잡한 함수를 단순하게 변경")
+
+        # ==================== 케이스: GROUP BY와 ORDER BY의 함수 불일치 ====================
+        if "ORDER BY" in sql_upper:
+            # 패턴 추출: GROUP BY 절
+            group_by_match = re.search(
+                r'GROUP\s+BY\s+([^;]+?)(?:\s+ORDER\s+BY|\s+LIMIT|\s*;|$)',
+                sql,
+                re.IGNORECASE | re.DOTALL
+            )
+
+            if group_by_match:
+                group_by_clause = group_by_match.group(1).strip()
+
+                # ORDER BY 절
+                order_by_match = re.search(
+                    r'ORDER\s+BY\s+([^;]+?)(?:\s+LIMIT|\s*;|$)',
+                    sql,
+                    re.IGNORECASE | re.DOTALL
+                )
+
+                if order_by_match:
+                    order_by_clause = order_by_match.group(1).strip()
+
+                    # 케이스 1: GROUP BY DATE(...) but ORDER BY column (DATE 없음)
+                    if "DATE(" in group_by_clause.upper() and "DATE(" not in order_by_clause.upper():
+                        date_func_match = re.search(
+                            r'(DATE\s*\([^)]+\))',
+                            group_by_clause,
+                            re.IGNORECASE
+                        )
+                        if date_func_match:
+                            date_func = date_func_match.group(1)
+                            original_order = order_by_clause.split()[0]
+
+                            sql = re.sub(
+                                rf'ORDER\s+BY\s+{re.escape(original_order)}\b',
+                                f'ORDER BY {date_func}',
+                                sql,
+                                flags=re.IGNORECASE
+                            )
+                            print(f"✏️ GROUP BY/ORDER BY 수정: ORDER BY를 {date_func}로 변경")
+
+                    # 케이스 2: GROUP BY column but ORDER BY DATE(...)
+                    elif "DATE(" not in group_by_clause.upper() and "DATE(" in order_by_clause.upper():
+                        order_by_col_match = re.search(
+                            r'ORDER\s+BY\s+DATE\s*\(([^)]+)\)',
+                            sql,
+                            re.IGNORECASE
+                        )
+                        if order_by_col_match:
+                            inner_col = order_by_col_match.group(1).strip()
+                            sql = re.sub(
+                                r'ORDER\s+BY\s+DATE\s*\([^)]+\)',
+                                f'ORDER BY {inner_col}',
+                                sql,
+                                flags=re.IGNORECASE
+                            )
+                            print(f"✏️ GROUP BY/ORDER BY 수정: ORDER BY를 {inner_col}로 변경")
+
+        return sql
+
+    @staticmethod
     def sanitize(sql: str, limit: int = 100) -> str:
         """
         SQL 쿼리 완전 정제
@@ -228,7 +329,8 @@ class SQLValidator:
         다음을 순서대로 수행:
         1. 주석 제거
         2. 공백 정규화
-        3. LIMIT 추가
+        3. GROUP BY/ORDER BY 일관성 수정
+        4. LIMIT 추가
 
         Args:
             sql: 원본 SQL
@@ -243,7 +345,10 @@ class SQLValidator:
         # 2. 공백 정규화
         sql = " ".join(sql.split())
 
-        # 3. LIMIT 추가
+        # 3. GROUP BY/ORDER BY 일관성 수정 (새로 추가)
+        sql = SQLValidator.fix_group_by_order_by(sql)
+
+        # 4. LIMIT 추가
         sql = SQLValidator.add_limit(sql, limit)
 
         return sql
@@ -348,3 +453,49 @@ if __name__ == "__main__":
     tables = SQLValidator.extract_tables(sql)
     print(f"  SQL:      {sql}")
     print(f"  테이블:   {tables}")
+
+    # 예제 4: GROUP BY/ORDER BY 수정 (새로 추가)
+    print("\n📝 예제 4: GROUP BY/ORDER BY 일관성 수정")
+    print("\n  [케이스 1] GROUP BY DATE(x) but ORDER BY x")
+    sql_case1 = """
+    SELECT DATE(production_date) as date, SUM(actual_quantity) as total
+    FROM production_data
+    WHERE DATE(production_date) IN (CURDATE(), DATE_SUB(CURDATE(), INTERVAL 1 DAY))
+    GROUP BY DATE(production_date)
+    ORDER BY production_date DESC
+    LIMIT 100;
+    """
+    fixed_case1 = SQLValidator.fix_group_by_order_by(sql_case1)
+    print(f"  원본:  ... ORDER BY production_date DESC")
+    print(f"  수정:  ... ORDER BY DATE(production_date) DESC")
+    if "ORDER BY DATE(" in fixed_case1.upper():
+        print(f"  ✅ 수정 완료!")
+    else:
+        print(f"  ❌ 수정 실패")
+
+    print("\n  [케이스 2] GROUP BY x but ORDER BY DATE(x)")
+    sql_case2 = """
+    SELECT line_id, SUM(actual_quantity) as total
+    FROM production_data
+    GROUP BY line_id
+    ORDER BY DATE(production_date) DESC
+    LIMIT 100;
+    """
+    fixed_case2 = SQLValidator.fix_group_by_order_by(sql_case2)
+    print(f"  원본:  ... ORDER BY DATE(production_date) DESC")
+    print(f"  수정:  ... ORDER BY production_date DESC")
+    if "ORDER BY production_date" in fixed_case2 and "DATE(" not in fixed_case2.split("ORDER BY")[1]:
+        print(f"  ✅ 수정 완료!")
+
+    print("\n  [케이스 3] 이미 일관된 경우 (수정 불필요)")
+    sql_case3 = """
+    SELECT DATE(production_date) as date, SUM(actual_quantity) as total
+    FROM production_data
+    GROUP BY DATE(production_date)
+    ORDER BY DATE(production_date) DESC
+    LIMIT 100;
+    """
+    fixed_case3 = SQLValidator.fix_group_by_order_by(sql_case3)
+    print(f"  원본:  ... ORDER BY DATE(production_date) DESC")
+    print(f"  결과:  변경 없음")
+    print(f"  ✅ 정상!")

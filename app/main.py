@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from app.models.user import User
 from app.models.chat import ChatThread, ChatMessage
 from app.models.prompt import PromptTable, PromptColumn, PromptDict, PromptKnowledge
+from app.models.admin import Term, Knowledge, SchemaField
 from app.db.database import create_all_tables, test_postgres_connection, test_mysql_connection, PostgresSessionLocal
 from app.service.schema_rag_service import SchemaRAGService
 
@@ -26,6 +27,9 @@ CORS_ORIGINS = [
     "http://localhost:8080",
     "http://10.0.2.2:8080",  # Android 에뮬레이터
     "http://localhost:3000",
+    "https://dxs20.iptime.org:8443",  # 프로덕션 프론트엔드
+    "https://dxs20.iptime.org",  # 프로덕션 프론트엔드 (포트 없음)
+    "*",  # 개발/테스트용 - 모든 origin 허용
 ]
 
 app.add_middleware(
@@ -59,6 +63,14 @@ async def startup_event():
         except Exception as e:
             print(f"⚠️ 스키마 임베딩 초기화 오류: {str(e)}")
 
+        # Supertonic TTS 초기화
+        try:
+            from app.service.supertonic_service import SupertonicService
+            SupertonicService.initialize()
+            print("✅ Supertonic TTS 초기화 완료")
+        except Exception as e:
+            print(f"⚠️ Supertonic TTS 초기화 오류: {str(e)}")
+
         print("✅ 모든 시작 절차 완료")
     else:
         print("❌ PostgreSQL 연결 실패 - 테이블을 생성할 수 없습니다")
@@ -88,9 +100,10 @@ async def root():
     }
 
 # API 라우트
-from app.api import auth, query
+from app.api import auth, query, admin
 app.include_router(auth.router)
 app.include_router(query.router)
+app.include_router(admin.router)
 
 if __name__ == "__main__":
     import uvicorn
