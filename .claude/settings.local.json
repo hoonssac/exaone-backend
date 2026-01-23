@@ -5,7 +5,8 @@
       "Bash(docker-compose build:*)",
       "Bash(docker exec:*)",
       "Bash(docker logs:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(python -m py_compile:*)"
     ]
   }
 }

@@ -133,7 +133,9 @@ class QueryService:
 
 판단 기준:
 - "새로운 데이터 조회 필요" (새로운 정보가 필요함) → yes
-  예) "오늘은?" "어제와 비교해줘" "다른 유형은?" "온도는?"
+  예) "오늘은?" "어제와 비교해줘" "다른 유형은?" "온도는?" "불량률은?" "평균은?" "합계는?"
+  ※ 중요: 불량률, 평균, 합계, 최고/최저 등 집계 메트릭은 항상 새로운 조회가 필요합니다!
+  ※ 이전 결과를 기반으로 계산할 수는 있지만, 일반적으로 정확한 DB 조회가 필요합니다
 
 - "새로운 조회 불필요" (이전 결과로 판단/비교하면 됨) → no
   예) "높은거야?" "많은거야?" "정상이야?" "맞아?" "어때?" "그래서?"
@@ -495,28 +497,36 @@ class QueryService:
 
             print(f"✅ SQL 필요 질문 확인")
 
-            # 5. 질문 보정 (용어 사전)
+            # 5. 질문 강화 (이전 질문의 날짜/기간 정보 포함) - 가장 먼저!
+            enhanced_message = QueryService.enhance_query_with_context(
+                current_query=request.message,
+                previous_query=previous_query
+            )
+            if enhanced_message != request.message:
+                print(f"🔗 질문 컨텍스트 강화 완료: '{enhanced_message}'")
+
+            # 6. 질문 보정 (용어 사전) - 강화된 메시지 기반
             corrected_message = QueryService.correct_message(
-                request.message,
+                enhanced_message,  # 강화된 메시지 보정
                 db_postgres
             )
 
-            # 4. 스키마 정보 조회
+            # 7. 스키마 정보 조회
             schema_info = QueryService.get_schema_info(db_postgres, db_mysql)
 
-            # 5. 프롬프트 지식 베이스 조회
+            # 8. 프롬프트 지식 베이스 조회
             knowledge_base = QueryService.get_knowledge_base(db_postgres)
 
-            # 6. RAG 컨텍스트 검색 (2가지: Conversation RAG + Schema RAG)
+            # 9. RAG 컨텍스트 검색 (2가지: Conversation RAG + Schema RAG)
             rag_context = []
             schema_hint = ""
 
-            # 5-1. Conversation RAG: 이전 대화 검색
+            # 9-1. Conversation RAG: 이전 대화 검색 - 강화된 메시지 사용
             try:
                 rag_context = RAGService.retrieve_context(
                     db_postgres,
                     thread_id=thread.id,
-                    query=request.message,
+                    query=enhanced_message,  # 강화된 메시지 사용
                     top_k=3
                 )
                 if rag_context:
@@ -525,11 +535,11 @@ class QueryService:
                 print(f"⚠️ Conversation RAG 검색 실패: {str(rag_error)}")
                 rag_context = []
 
-            # 5-2. Schema RAG: 스키마 기반 검색 (테이블/컬럼 자동 매핑)
+            # 9-2. Schema RAG: 스키마 기반 검색 (테이블/컬럼 자동 매핑) - 강화된 메시지 사용
             try:
                 schema_results = SchemaRAGService.search_similar_schema(
                     db_postgres,
-                    query=request.message,
+                    query=enhanced_message,  # 강화된 메시지 사용!
                     top_k=5
                 )
                 if schema_results:
@@ -540,19 +550,19 @@ class QueryService:
                 print(f"⚠️ Schema RAG 검색 실패: {str(schema_rag_error)}")
                 schema_hint = ""
 
-            # 7. SQL 생성 (Ollama EXAONE → Mock 폴백)
+            # 10. SQL 생성 (Ollama EXAONE → Mock 폴백)
             # 우선 순서: Ollama EXAONE → Mock 폴백
             generated_sql = None
             try:
                 print(f"🔄 [1단계] Ollama EXAONE SQL 생성 중...")
 
                 # 통합 프롬프트 구성: Conversation RAG + Schema RAG
-                api_query = request.message
+                api_query = enhanced_message  # 강화된 질문 사용
 
                 # Conversation RAG 컨텍스트 추가
                 if rag_context:
                     rag_prompt = RAGService.build_rag_prompt(
-                        user_query=request.message,
+                        user_query=enhanced_message,  # 강화된 질문 사용
                         context=rag_context,
                         schema_info=schema_info
                     )
@@ -561,8 +571,8 @@ class QueryService:
 
                 # Schema RAG 힌트 추가
                 if schema_hint:
-                    if api_query == request.message:
-                        api_query = schema_hint + "\n질문: " + request.message
+                    if api_query == enhanced_message:  # enhanced_message와 비교
+                        api_query = schema_hint + "\n질문: " + enhanced_message
                     else:
                         api_query = schema_hint + "\n" + api_query
                     print(f"🗂️ 스키마 힌트 추가됨")
@@ -580,7 +590,7 @@ class QueryService:
                 print(f"⚠️ Ollama EXAONE 오류 ({str(ollama_error)}), Mock으로 폴백...")
                 try:
                     generated_sql = ExaoneService.nl_to_sql(
-                        user_query=request.message,
+                        user_query=enhanced_message,  # 강화된 메시지 사용
                         corrected_query=corrected_message,
                         schema_info=schema_info,
                         knowledge_base=knowledge_base
@@ -597,10 +607,10 @@ class QueryService:
             # SQL 정제 (LIMIT 추가 등)
             sanitized_sql = SQLValidator.sanitize(generated_sql)
 
-            # 9. MySQL에서 쿼리 실행
+            # 11. MySQL에서 쿼리 실행
             result_data = QueryService.execute_query(db_mysql, sanitized_sql)
 
-            # 10. [2단계] 자연어 응답 생성
+            # 12. [2단계] 자연어 응답 생성
             print(f"🔄 [2단계] Ollama EXAONE 자연어 응답 생성 중...")
             try:
                 result_data_for_llm = {
@@ -618,7 +628,7 @@ class QueryService:
                 # 응답 생성 실패 시 기본 응답 사용
                 natural_response = f"데이터 조회 완료: {result_data.row_count}행 반환되었습니다."
 
-            # 11. 대화 기록 저장
+            # 13. 대화 기록 저장
             message = ChatMessage(
                 thread_id=thread.id,
                 role="user",
@@ -691,6 +701,88 @@ class QueryService:
         except Exception as e:
             db_postgres.rollback()
             raise Exception(f"쿼리 처리 중 오류: {str(e)}")
+
+    @staticmethod
+    def extract_date_from_query(query: str) -> Optional[str]:
+        """
+        질문에서 날짜/기간 정보 추출
+
+        예: "2026년 1월 11일" "어제" "지난주" "오늘" 등
+
+        Args:
+            query: 사용자 질문
+
+        Returns:
+            추출된 날짜 문자열, 없으면 None
+        """
+        import re
+
+        # 연-월-일 형식
+        date_patterns = [
+            r'\d{4}년\s*\d{1,2}월\s*\d{1,2}일',  # 2026년 1월 11일
+            r'\d{4}-\d{1,2}-\d{1,2}',             # 2026-01-11
+        ]
+
+        for pattern in date_patterns:
+            match = re.search(pattern, query)
+            if match:
+                return match.group(0)
+
+        # 상대적 날짜 표현
+        relative_dates = {
+            '오늘': '오늘',
+            '어제': '어제',
+            '내일': '내일',
+            '모레': '모레',
+            '그저께': '그저께',
+            '재어제': '재어제',
+            '지난주': '지난주',
+            '이번주': '이번주',
+            '지난달': '지난달',
+            '이번달': '이번달',
+        }
+
+        for date_term, date_value in relative_dates.items():
+            if date_term in query:
+                return date_value
+
+        return None
+
+    @staticmethod
+    def enhance_query_with_context(current_query: str, previous_query: Optional[str]) -> str:
+        """
+        이전 질문의 날짜 정보를 현재 질문에 포함시킴
+
+        예:
+        - 이전: "2026년 1월 11일 생산량 알려줘"
+        - 현재: "불량률은?"
+        - 결과: "2026년 1월 11일의 불량률은?"
+
+        Args:
+            current_query: 현재 사용자 질문
+            previous_query: 이전 사용자 질문
+
+        Returns:
+            강화된 질문
+        """
+        if not previous_query:
+            return current_query
+
+        extracted_date = QueryService.extract_date_from_query(previous_query)
+        if not extracted_date:
+            return current_query
+
+        # 현재 질문에 날짜가 이미 있으면 그대로 반환
+        if QueryService.extract_date_from_query(current_query):
+            return current_query
+
+        # 간단한 질문("불량률은?", "온도는?" 등)에 날짜 추가
+        if len(current_query) < 20 and current_query.strip().endswith('?'):
+            enhanced = f"{extracted_date}의 {current_query}"
+            print(f"✅ 질문 강화: '{current_query}' → '{enhanced}'")
+            return enhanced
+
+        return current_query
 
     @staticmethod
     def correct_message(message: str, db: Session) -> str:

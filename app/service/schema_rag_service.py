@@ -41,7 +41,7 @@ class SchemaRAGService:
                 "description": "사출기 설비 정보",
                 "keywords": ["설비", "사출기", "장비", "기계"],
                 "columns": [
-                    {"name": "id", "type": "INT", "description": "설비 ID"},
+                    {"name": "id", "type": "INT", "description": "설비 ID (PK)"},
                     {"name": "equipment_id", "type": "VARCHAR", "description": "설비 코드 (IM-850-001)"},
                     {"name": "equipment_name", "type": "VARCHAR", "description": "설비명"},
                     {"name": "manufacturer", "type": "VARCHAR", "description": "제조사"},
@@ -50,6 +50,7 @@ class SchemaRAGService:
                     {"name": "last_maintenance_date", "type": "DATE", "description": "마지막 유지보수 일자"},
                     {"name": "status", "type": "VARCHAR", "description": "상태 (가동/정지/점검)"},
                     {"name": "operating_hours", "type": "BIGINT", "description": "누적 가동 시간"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -58,7 +59,7 @@ class SchemaRAGService:
                 "description": "금형 정보 (Cap Decor Upper)",
                 "keywords": ["금형", "금형정보", "제품", "제품코드", "캐비티"],
                 "columns": [
-                    {"name": "id", "type": "INT", "description": "금형 ID"},
+                    {"name": "id", "type": "INT", "description": "금형 ID (PK)"},
                     {"name": "mold_code", "type": "VARCHAR", "description": "금형 코드 (DC1)"},
                     {"name": "mold_name", "type": "VARCHAR", "description": "금형명"},
                     {"name": "product_code", "type": "VARCHAR", "description": "제품 코드"},
@@ -68,8 +69,12 @@ class SchemaRAGService:
                     {"name": "target_weight_tolerance_minus", "type": "DECIMAL", "description": "무게 허용공차 -"},
                     {"name": "target_weight_tolerance_plus", "type": "DECIMAL", "description": "무게 허용공차 +"},
                     {"name": "runner_weight_g", "type": "DECIMAL", "description": "러너 무게"},
+                    {"name": "total_weight_g", "type": "DECIMAL", "description": "총 무게 제품+러너 (519.0g)"},
                     {"name": "cooling_zones", "type": "INT", "description": "냉각 존 수"},
                     {"name": "hot_runner_zones", "type": "INT", "description": "핫 러너 존 수"},
+                    {"name": "mold_manufacturer", "type": "VARCHAR", "description": "금형 제작사"},
+                    {"name": "status", "type": "VARCHAR", "description": "상태 (사용중/정지/유지보수)"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -78,7 +83,7 @@ class SchemaRAGService:
                 "description": "원재료 사양 (HIPS)",
                 "keywords": ["재료", "원재료", "자재", "HIPS", "재료온도"],
                 "columns": [
-                    {"name": "id", "type": "INT", "description": "자재 ID"},
+                    {"name": "id", "type": "INT", "description": "자재 ID (PK)"},
                     {"name": "material_code", "type": "VARCHAR", "description": "자재 코드"},
                     {"name": "material_name", "type": "VARCHAR", "description": "자재명 (HIPS)"},
                     {"name": "material_grade", "type": "VARCHAR", "description": "등급"},
@@ -91,6 +96,7 @@ class SchemaRAGService:
                     {"name": "cylinder_temp_h4", "type": "INT", "description": "H4 온도 설정값 (200℃)"},
                     {"name": "melting_point_min", "type": "INT", "description": "최소 용융 온도 (180℃)"},
                     {"name": "melting_point_max", "type": "INT", "description": "최대 용융 온도 (240℃)"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -99,10 +105,14 @@ class SchemaRAGService:
                 "description": "개별 사이클 데이터 (585,920행) - 핵심 테이블",
                 "keywords": ["사이클", "생산", "온도", "압력", "무게", "불량", "주기"],
                 "columns": [
-                    {"name": "id", "type": "BIGINT", "description": "사이클 ID"},
+                    {"name": "id", "type": "BIGINT", "description": "사이클 ID (PK)"},
+                    {"name": "machine_id", "type": "INT", "description": "설비 ID (사출기 1, 2, 3...)"},
+                    {"name": "mold_id", "type": "INT", "description": "금형 ID (DC1 금형)"},
+                    {"name": "material_id", "type": "INT", "description": "재료 ID (HIPS 등)"},
                     {"name": "cycle_date", "type": "DATE", "description": "사이클 실행 날짜"},
                     {"name": "cycle_hour", "type": "TINYINT", "description": "시간 (0-23)"},
                     {"name": "cycle_minute", "type": "TINYINT", "description": "분 (0-59)"},
+                    {"name": "cycle_sequence", "type": "INT", "description": "시간 내 순서"},
                     {"name": "temp_nh", "type": "INT", "description": "NH 온도 (℃)"},
                     {"name": "temp_h1", "type": "INT", "description": "H1 온도 (℃)"},
                     {"name": "temp_h2", "type": "INT", "description": "H2 온도 (℃)"},
@@ -119,7 +129,10 @@ class SchemaRAGService:
                     {"name": "weight_ok", "type": "BOOLEAN", "description": "무게 합격 여부"},
                     {"name": "has_defect", "type": "BOOLEAN", "description": "불량 여부"},
                     {"name": "defect_type_id", "type": "INT", "description": "불량 유형 ID"},
+                    {"name": "defect_description", "type": "VARCHAR", "description": "불량 설명"},
                     {"name": "visual_inspection_ok", "type": "BOOLEAN", "description": "외관 검사 합격"},
+                    {"name": "operator_id", "type": "VARCHAR", "description": "담당 작업자 ID"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -128,14 +141,18 @@ class SchemaRAGService:
                 "description": "시간별 생산 요약 (8,760행)",
                 "keywords": ["시간별", "요약", "시간", "시간당", "시간별생산"],
                 "columns": [
+                    {"name": "id", "type": "BIGINT", "description": "요약 ID (PK)"},
                     {"name": "summary_date", "type": "DATE", "description": "요약 날짜"},
                     {"name": "summary_hour", "type": "TINYINT", "description": "시간 (0-23)"},
+                    {"name": "machine_id", "type": "INT", "description": "설비 ID"},
+                    {"name": "mold_id", "type": "INT", "description": "금형 ID"},
                     {"name": "total_cycles", "type": "INT", "description": "총 사이클 수"},
                     {"name": "good_products", "type": "INT", "description": "정상 제품 수"},
                     {"name": "defective_products", "type": "INT", "description": "불량 제품 수"},
                     {"name": "defect_rate", "type": "DECIMAL", "description": "불량률 (%)"},
                     {"name": "avg_weight_g", "type": "DECIMAL", "description": "평균 무게 (g)"},
                     {"name": "weight_variance", "type": "DECIMAL", "description": "무게 표준편차"},
+                    {"name": "weight_out_of_spec", "type": "INT", "description": "규격 외 무게 개수"},
                     {"name": "avg_temp_h1", "type": "DECIMAL", "description": "평균 H1 온도 (℃)"},
                     {"name": "avg_temp_h2", "type": "DECIMAL", "description": "평균 H2 온도 (℃)"},
                     {"name": "avg_temp_mold", "type": "DECIMAL", "description": "평균 금형 온도 (℃)"},
@@ -143,6 +160,7 @@ class SchemaRAGService:
                     {"name": "void_count", "type": "INT", "description": "Void 불량 수"},
                     {"name": "weld_line_count", "type": "INT", "description": "Weld Line 불량 수"},
                     {"name": "jetting_count", "type": "INT", "description": "Jetting 불량 수"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -151,7 +169,10 @@ class SchemaRAGService:
                 "description": "일별 생산 통계 (365행)",
                 "keywords": ["일별", "일일", "매일", "날짜", "생산량", "생산", "통계"],
                 "columns": [
+                    {"name": "id", "type": "BIGINT", "description": "요약 ID (PK)"},
                     {"name": "production_date", "type": "DATE", "description": "생산 날짜"},
+                    {"name": "machine_id", "type": "INT", "description": "설비 ID"},
+                    {"name": "mold_id", "type": "INT", "description": "금형 ID"},
                     {"name": "total_cycles_produced", "type": "INT", "description": "총 사이클 수"},
                     {"name": "good_products_count", "type": "INT", "description": "정상 제품 개수"},
                     {"name": "defective_count", "type": "INT", "description": "불량 제품 개수"},
@@ -164,6 +185,7 @@ class SchemaRAGService:
                     {"name": "avg_weight_g", "type": "DECIMAL", "description": "평균 무게 (g)"},
                     {"name": "weight_min_g", "type": "DECIMAL", "description": "최소 무게 (g)"},
                     {"name": "weight_max_g", "type": "DECIMAL", "description": "최대 무게 (g)"},
+                    {"name": "weight_out_of_spec_count", "type": "INT", "description": "규격 외 무게 개수"},
                     {"name": "avg_cylinder_temp", "type": "DECIMAL", "description": "평균 실린더 온도 (℃)"},
                     {"name": "avg_mold_temp", "type": "DECIMAL", "description": "평균 금형 온도 (℃)"},
                     {"name": "temp_stability_ok", "type": "BOOLEAN", "description": "온도 안정성 여부"},
@@ -173,6 +195,7 @@ class SchemaRAGService:
                     {"name": "jetting_count", "type": "INT", "description": "Jetting 불량 수"},
                     {"name": "flow_mark_count", "type": "INT", "description": "Flow Mark 불량 수"},
                     {"name": "other_defect_count", "type": "INT", "description": "기타 불량 수"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -181,13 +204,14 @@ class SchemaRAGService:
                 "description": "불량 유형 정의 (Flash, Void, Weld Line 등 9가지)",
                 "keywords": ["불량", "결함", "불량유형", "Flash", "Void", "Weld", "Jetting"],
                 "columns": [
-                    {"name": "id", "type": "INT", "description": "불량 유형 ID"},
+                    {"name": "id", "type": "INT", "description": "불량 유형 ID (PK)"},
                     {"name": "defect_code", "type": "VARCHAR", "description": "불량 코드 (D001-D009)"},
                     {"name": "defect_name_kr", "type": "VARCHAR", "description": "불량명 (한글)"},
                     {"name": "defect_name_en", "type": "VARCHAR", "description": "불량명 (영문)"},
                     {"name": "defect_category", "type": "VARCHAR", "description": "불량 분류 (외관/기능/치수)"},
                     {"name": "severity", "type": "VARCHAR", "description": "심각도 (경/중/심)"},
                     {"name": "cause_description", "type": "TEXT", "description": "원인 설명"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -196,7 +220,8 @@ class SchemaRAGService:
                 "description": "설비 유지보수 기록",
                 "keywords": ["유지보수", "정비", "점검", "수리", "개선", "교체"],
                 "columns": [
-                    {"name": "id", "type": "BIGINT", "description": "유지보수 ID"},
+                    {"name": "id", "type": "BIGINT", "description": "유지보수 ID (PK)"},
+                    {"name": "machine_id", "type": "INT", "description": "설비 ID"},
                     {"name": "maintenance_type", "type": "VARCHAR", "description": "유지보수 유형 (정기/수리/개선)"},
                     {"name": "scheduled_date", "type": "DATE", "description": "예정 일자"},
                     {"name": "actual_date", "type": "DATE", "description": "실제 시공 일자"},
@@ -205,6 +230,7 @@ class SchemaRAGService:
                     {"name": "parts_replaced", "type": "VARCHAR", "description": "교체 부품"},
                     {"name": "cost", "type": "DECIMAL", "description": "작업 비용 (원)"},
                     {"name": "status", "type": "VARCHAR", "description": "상태 (예정/진행중/완료)"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
             {
@@ -213,13 +239,15 @@ class SchemaRAGService:
                 "description": "에너지 사용량 (시간별)",
                 "keywords": ["에너지", "전력", "냉각수", "전기", "에너지사용"],
                 "columns": [
-                    {"name": "id", "type": "BIGINT", "description": "에너지 ID"},
+                    {"name": "id", "type": "BIGINT", "description": "에너지 ID (PK)"},
+                    {"name": "machine_id", "type": "INT", "description": "설비 ID"},
                     {"name": "energy_type", "type": "VARCHAR", "description": "에너지 유형 (전력/냉각수)"},
                     {"name": "usage_date", "type": "DATE", "description": "사용 날짜"},
                     {"name": "usage_hour", "type": "TINYINT", "description": "시간 (0-23)"},
                     {"name": "consumption_value", "type": "DECIMAL", "description": "사용량"},
                     {"name": "unit", "type": "VARCHAR", "description": "단위 (kWh/ton)"},
                     {"name": "cost", "type": "DECIMAL", "description": "비용 (원)"},
+                    {"name": "created_at", "type": "DATETIME", "description": "등록 일시"},
                 ]
             },
         ]

@@ -131,30 +131,41 @@ class OllamaExaoneService:
 ## SQL 생성 규칙
 1. MySQL 문법 사용
 2. SELECT 쿼리만 생성 (INSERT, UPDATE, DELETE 금지)
-3. 모든 쿼리에 LIMIT 100 추가
+3. LIMIT 적용 규칙:
+   - 집계 쿼리(COUNT, SUM, AVG 등): LIMIT 없음 (1행만 반환)
+   - daily_production, production_summary: LIMIT 없음 (이미 집계된 데이터)
+   - injection_cycle 상세 쿼리: LIMIT 1000 (너무 많은 행 방지)
 4. 집계 함수 사용 시 명확한 별칭 제공
 5. 주석 제외
 6. 비교 질문("더 많다", "차이", "비교")이 있으면 두 기간의 데이터를 모두 조회
 
+## 중요: 외래키 정보
+- injection_cycle 테이블: machine_id (설비 ID), mold_id (금형 ID), material_id (재료 ID)
+- "1번 사출기", "기계 2번", "2호기" 등은 machine_id로 필터링합니다
+- injection_molding_machine 테이블의 equipment_id는 사용하지 않습니다
+
 ## 예제 (사출 성형)
 
 질문: "오늘 생산량은?"
-SQL: SELECT COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date = CURDATE() LIMIT 100;
-
-질문: "어제 불량유형별 불량은?"
-SQL: SELECT defect_type_id, COUNT(*) as count FROM injection_cycle WHERE cycle_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND has_defect = 1 GROUP BY defect_type_id ORDER BY count DESC LIMIT 100;
+SQL: SELECT COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date = CURDATE();
 
 질문: "어제 불량은?"
-SQL: SELECT COUNT(*) as defect_count FROM injection_cycle WHERE cycle_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND has_defect = 1 LIMIT 100;
+SQL: SELECT COUNT(*) as defect_count FROM injection_cycle WHERE cycle_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND has_defect = 1;
+
+질문: "1번 사출기 오늘 생산량은?"
+SQL: SELECT COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date = CURDATE() AND machine_id = 1;
+
+질문: "어제 2호기 불량유형별 불량은?"
+SQL: SELECT defect_type_id, COUNT(*) as count FROM injection_cycle WHERE cycle_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND machine_id = 2 AND has_defect = 1 GROUP BY defect_type_id ORDER BY count DESC;
 
 질문: "오늘 불량률은?"
-SQL: SELECT COUNT(*) as total, SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) as defect_count, ROUND(SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as defect_rate FROM injection_cycle WHERE cycle_date = CURDATE() LIMIT 100;
+SQL: SELECT COUNT(*) as total, SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) as defect_count, ROUND(SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as defect_rate FROM injection_cycle WHERE cycle_date = CURDATE();
 
 질문: "지난주 제품 무게 평균은?"
-SQL: SELECT AVG(product_weight_g) as avg_weight, MIN(product_weight_g) as min_weight, MAX(product_weight_g) as max_weight FROM injection_cycle WHERE cycle_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) LIMIT 100;
+SQL: SELECT AVG(product_weight_g) as avg_weight, MIN(product_weight_g) as min_weight, MAX(product_weight_g) as max_weight FROM injection_cycle WHERE cycle_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY);
 
 질문: "어제와 오늘 생산량을 비교해줘"
-SQL: SELECT cycle_date, COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) GROUP BY cycle_date ORDER BY cycle_date DESC LIMIT 100;
+SQL: SELECT cycle_date, COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) GROUP BY cycle_date ORDER BY cycle_date DESC;
 
 ## 사용자 질문
 "{user_query}"
@@ -185,15 +196,19 @@ SQL: SELECT cycle_date, COUNT(*) as total_cycles FROM injection_cycle WHERE cycl
 
         sql = " ".join([l for l in lines if l])
 
-        # SELECT ... LIMIT 패턴 추출
-        select_pattern = r'SELECT\s+.*?\s+LIMIT\s+\d+'
-        match = re.search(select_pattern, sql, re.IGNORECASE | re.DOTALL)
+        # SELECT 쿼리 추출 (LIMIT 있든 없든 모두 지원)
+        # 1. LIMIT이 있는 경우
+        select_with_limit = r'SELECT\s+.*?\s+LIMIT\s+\d+'
+        match = re.search(select_with_limit, sql, re.IGNORECASE | re.DOTALL)
 
         if match:
             sql = match.group(0)
-            if not sql.endswith(";"):
-                sql += ";"
-            return sql
+        else:
+            # 2. LIMIT이 없는 경우: SELECT부터 끝까지 (또는 다른 키워드까지)
+            select_pattern = r'SELECT\s+[^;]+'
+            match = re.search(select_pattern, sql, re.IGNORECASE | re.DOTALL)
+            if match:
+                sql = match.group(0).strip()
 
         if not sql.endswith(";"):
             sql += ";"

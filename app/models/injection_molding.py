@@ -5,7 +5,7 @@ injection_molding_machine, mold_info, material_spec, injection_cycle 등
 사출 성형 제조 시스템의 모든 테이블 정의
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, Date, DECIMAL, BigInteger, TINYINT
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, Date, DECIMAL, BigInteger, TINYINT, ForeignKey
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.db.database import Base
@@ -99,8 +99,8 @@ class InjectionProcessParameter(Base):
     __tablename__ = "injection_process_parameter"
 
     id = Column(Integer, primary_key=True, autoincrement=True, comment="파라미터 ID")
-    mold_id = Column(Integer, nullable=False, comment="금형 ID (외래키)")
-    material_id = Column(Integer, nullable=False, comment="재료 ID (외래키)")
+    mold_id = Column(Integer, ForeignKey("mold_info.id"), nullable=False, comment="금형 ID (외래키)")
+    material_id = Column(Integer, ForeignKey("material_spec.id"), nullable=False, comment="재료 ID (외래키)")
     injection_time = Column(Integer, comment="사출 시간 (8.7초)")
     pressure_hold_time = Column(Integer, comment="보압 시간 (25초)")
     cooling_time = Column(Integer, comment="냉각 시간 (10초)")
@@ -155,9 +155,9 @@ class InjectionCycle(Base):
     __tablename__ = "injection_cycle"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="사이클 ID")
-    machine_id = Column(Integer, nullable=False, comment="설비 ID")
-    mold_id = Column(Integer, nullable=False, comment="금형 ID")
-    material_id = Column(Integer, nullable=False, comment="재료 ID")
+    machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
+    mold_id = Column(Integer, ForeignKey("mold_info.id"), nullable=False, comment="금형 ID")
+    material_id = Column(Integer, ForeignKey("material_spec.id"), nullable=False, comment="재료 ID")
     cycle_date = Column(Date, nullable=False, comment="사이클 실행 날짜")
     cycle_hour = Column(TINYINT, nullable=False, comment="시간 (0-23)")
     cycle_minute = Column(TINYINT, nullable=False, comment="분 (0-59)")
@@ -183,7 +183,7 @@ class InjectionCycle(Base):
     weight_deviation_g = Column(DECIMAL(8, 2), comment="목표 대비 편차 (g)")
     weight_ok = Column(Boolean, comment="무게 합격 여부")
     has_defect = Column(Boolean, default=False, comment="불량 여부")
-    defect_type_id = Column(Integer, comment="불량 유형 ID")
+    defect_type_id = Column(Integer, ForeignKey("injection_defect_type.id"), comment="불량 유형 ID")
     defect_description = Column(String(255), comment="불량 설명")
     visual_inspection_ok = Column(Boolean, comment="외관 검사 합격 여부")
 
@@ -205,8 +205,8 @@ class ProductionSummary(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="요약 ID")
     summary_date = Column(Date, nullable=False, comment="요약 날짜")
     summary_hour = Column(TINYINT, nullable=False, comment="시간 (0-23)")
-    machine_id = Column(Integer, nullable=False, comment="설비 ID")
-    mold_id = Column(Integer, nullable=False, comment="금형 ID")
+    machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
+    mold_id = Column(Integer, ForeignKey("mold_info.id"), nullable=False, comment="금형 ID")
 
     total_cycles = Column(Integer, default=0, comment="총 사이클 수")
     good_products = Column(Integer, default=0, comment="정상 제품 수")
@@ -242,8 +242,8 @@ class DailyProduction(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="요약 ID")
     production_date = Column(Date, nullable=False, unique=True, comment="생산 날짜")
-    machine_id = Column(Integer, nullable=False, comment="설비 ID")
-    mold_id = Column(Integer, nullable=False, comment="금형 ID")
+    machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
+    mold_id = Column(Integer, ForeignKey("mold_info.id"), nullable=False, comment="금형 ID")
 
     total_cycles_produced = Column(Integer, default=0, comment="총 사이클 수")
     good_products_count = Column(Integer, default=0, comment="정상 제품 개수")
@@ -290,7 +290,7 @@ class EquipmentMaintenance(Base):
     __tablename__ = "equipment_maintenance"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="유지보수 ID")
-    machine_id = Column(Integer, nullable=False, comment="설비 ID")
+    machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
     maintenance_type = Column(String(50), comment="유지보수 유형 (정기/수리/개선)")
     scheduled_date = Column(Date, nullable=False, comment="예정 일자")
     actual_date = Column(Date, comment="실제 시공 일자")
@@ -313,7 +313,7 @@ class EnergyUsage(Base):
     __tablename__ = "energy_usage"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="에너지 ID")
-    machine_id = Column(Integer, nullable=False, comment="설비 ID")
+    machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
     energy_type = Column(String(20), comment="에너지 유형 (전력/냉각수)")
     usage_date = Column(Date, nullable=False, comment="사용 날짜")
     usage_hour = Column(TINYINT, comment="시간 (0-23)")

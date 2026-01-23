@@ -227,12 +227,20 @@ class ExaoneService:
                 query, table_name
             )
         else:
-            select_clause = "SELECT *"
+            # 비집계 쿼리일 때 테이블별로 주요 컬럼만 선택
+            if table_name == "daily_production":
+                select_clause = "SELECT production_date, machine_id, mold_id, total_cycles_produced, good_products_count, defective_count, defect_rate"
+            elif table_name == "production_summary":
+                select_clause = "SELECT summary_date, summary_hour, machine_id, mold_id, total_cycles, good_products, defective_products, defect_rate"
+            elif table_name == "injection_cycle":
+                select_clause = "SELECT cycle_date, machine_id, mold_id, product_weight_g, has_defect, defect_type_id"
+            else:
+                select_clause = "SELECT *"
 
         # 2. FROM 절
         from_clause = f"FROM {table_name}"
 
-        # 3. WHERE 절 구성 (날짜, 불량 유형 등)
+        # 3. WHERE 절 구성 (날짜, 불량 유형, 설비 등)
         where_clauses = []
 
         # 날짜 필터 (cycle_date 또는 date 컬럼 사용)
@@ -243,10 +251,25 @@ class ExaoneService:
                 elif table_name == "daily_production":
                     where_clauses.append(f"production_date = {date_expr}")
                 elif table_name == "production_summary":
-                    where_clauses.append(f"DATE(summary_datetime) = {date_expr}")
+                    where_clauses.append(f"summary_date = {date_expr}")  # 버그 수정: summary_datetime → summary_date
                 elif table_name == "energy_usage":
                     where_clauses.append(f"usage_date = {date_expr}")
                 break
+
+        # 설비(사출기) 필터: "1번", "2호기", "1번 사출기" 등
+        machine_match = re.search(r'(\d+)\s*(?:번|호|호기|사출기)?', query)
+        if machine_match:
+            machine_num = machine_match.group(1)
+            # 모든 테이블이 machine_id를 가지고 있음
+            where_clauses.append(f"machine_id = {machine_num}")
+            print(f"✅ 설비 필터 추가: machine_id = {machine_num}")
+
+        # 금형 필터: "DC1" 등
+        mold_match = re.search(r'DC\d+|DC[A-Z0-9]+', query)
+        if mold_match:
+            mold_code = mold_match.group(0)
+            # mold_info 조인이 없으면 mold_id로 직접 필터 (현재는 간단히 추가 안함)
+            print(f"⚠️ 금형 필터 감지: {mold_code} (향후 JOIN 로직 추가 필요)")
 
         # 불량 유형 필터
         if "flash" in query_lower or "플래시" in query_lower:
@@ -283,12 +306,19 @@ class ExaoneService:
         elif table_name == "daily_production":
             order_by_clause = "ORDER BY production_date DESC"
         elif table_name == "production_summary":
-            order_by_clause = "ORDER BY summary_datetime DESC"
+            order_by_clause = "ORDER BY summary_date DESC"  # 버그 수정: summary_datetime → summary_date
         else:
             order_by_clause = "ORDER BY id DESC"
 
-        # 6. LIMIT 절 (강제)
-        limit_clause = "LIMIT 100"
+        # 6. LIMIT 절 (똑똑하게 적용)
+        # - 집계 쿼리: LIMIT 없음 (어차피 1행 또는 소수 행만 반환)
+        # - 요약 테이블(daily_production, production_summary): LIMIT 없음 (데이터가 적음)
+        # - 상세 테이블(injection_cycle): LIMIT 1000 (너무 많은 행 방지, 100은 너무 작음)
+        limit_clause = ""
+        if not intent["is_aggregation"]:
+            if table_name == "injection_cycle":
+                limit_clause = "LIMIT 1000"  # 상세 데이터는 다수 행 가능
+            # daily_production, production_summary는 LIMIT 없음 (이미 집계됨)
 
         # SQL 조합
         sql_parts = [select_clause, from_clause]
@@ -297,7 +327,8 @@ class ExaoneService:
         if group_by_clause:
             sql_parts.append(group_by_clause)
         sql_parts.append(order_by_clause)
-        sql_parts.append(limit_clause)
+        if limit_clause:  # LIMIT이 있을 때만 추가
+            sql_parts.append(limit_clause)
 
         sql = " ".join(sql_parts) + ";"
 
@@ -309,40 +340,70 @@ class ExaoneService:
         집계 함수를 포함한 SELECT 절 구성 (사출 성형)
 
         예:
-        - "총 사이클 수" → COUNT(*)
+        - "총 사이클 수" → COUNT(*) (injection_cycle) 또는 total_cycles_produced (daily_production)
         - "평균 무게" → AVG(product_weight_g)
-        - "불량률" → SUM(CASE WHEN has_defect THEN 1 ELSE 0 END) / COUNT(*) * 100
+        - "불량률" → defect_rate (daily_production) 또는 계산식 (injection_cycle)
         """
         query_lower = query.lower()
 
-        # 사이클/생산량 관련 집계
+        # 사이클/생산량 관련 집계 - 테이블별로 다르게 처리
         if any(kw in query_lower for kw in ["사이클", "생산", "생산량", "개수"]):
-            if "일별" in query_lower or "시간별" in query_lower:
+            # ★ daily_production: 이미 계산된 컬럼 사용
+            if table_name == "daily_production":
+                return "SELECT production_date, total_cycles_produced, good_products_count, defective_count, defect_rate"
+            # ★ production_summary: 이미 계산된 컬럼 사용
+            elif table_name == "production_summary":
+                return "SELECT summary_date, summary_hour, total_cycles, good_products, defective_products, defect_rate"
+            # injection_cycle: 직접 계산
+            elif "일별" in query_lower or "시간별" in query_lower:
                 return "SELECT COUNT(*) as total_cycles, SUM(CASE WHEN has_defect = 0 THEN 1 ELSE 0 END) as good_count"
             else:
                 return "SELECT COUNT(*) as total_cycles, COUNT(DISTINCT cycle_date) as cycle_dates"
 
         # 불량 관련 집계
         elif any(kw in query_lower for kw in ["불량", "결함"]):
-            if "율" in query_lower or "rate" in query_lower:
+            # ★ daily_production/production_summary: 이미 계산된 컬럼 사용
+            if table_name == "daily_production":
+                return "SELECT production_date, defective_count, total_cycles_produced, defect_rate"
+            elif table_name == "production_summary":
+                return "SELECT summary_date, summary_hour, defective_products, total_cycles, defect_rate"
+            # injection_cycle: 직접 계산
+            elif "율" in query_lower or "rate" in query_lower:
                 return "SELECT COUNT(*) as total, SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) as defect_count, ROUND(SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as defect_rate"
             else:
                 return "SELECT SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) as defect_count, COUNT(*) as total_cycles"
 
         # 무게 관련 집계
         elif any(kw in query_lower for kw in ["무게", "weight"]):
-            if "평균" in query_lower:
+            # ★ daily_production: 이미 계산된 컬럼 사용
+            if table_name == "daily_production":
+                return "SELECT production_date, avg_weight_g, weight_min_g, weight_max_g, weight_out_of_spec_count"
+            # injection_cycle: 직접 계산
+            elif "평균" in query_lower:
                 return "SELECT AVG(product_weight_g) as avg_weight, MIN(product_weight_g) as min_weight, MAX(product_weight_g) as max_weight, STDDEV(product_weight_g) as stddev_weight"
             else:
                 return "SELECT AVG(product_weight_g) as avg_weight, COUNT(*) as total_cycles"
 
         # 온도 관련 집계
         elif any(kw in query_lower for kw in ["온도"]):
-            return "SELECT AVG(temp_nh) as avg_nh, AVG(temp_h1) as avg_h1, AVG(temp_h2) as avg_h2, AVG(temp_h3) as avg_h3, AVG(temp_h4) as avg_h4"
+            # ★ daily_production: 이미 계산된 컬럼 사용
+            if table_name == "daily_production":
+                return "SELECT production_date, avg_cylinder_temp, avg_mold_temp"
+            # production_summary도 비슷한 컬럼이 있으면 사용
+            elif table_name == "production_summary":
+                return "SELECT summary_date, summary_hour, avg_temp_h1, avg_temp_h2, avg_temp_mold"
+            # injection_cycle: 직접 계산
+            else:
+                return "SELECT AVG(temp_nh) as avg_nh, AVG(temp_h1) as avg_h1, AVG(temp_h2) as avg_h2, AVG(temp_h3) as avg_h3, AVG(temp_h4) as avg_h4"
 
         # 압력 관련 집계
         elif any(kw in query_lower for kw in ["압력"]):
-            return "SELECT AVG(pressure_primary) as avg_primary, AVG(pressure_secondary) as avg_secondary, AVG(pressure_holding) as avg_holding"
+            # ★ daily_production: 평균 압력 데이터는 없음 (injection_cycle만 필터링)
+            if table_name == "injection_cycle":
+                return "SELECT AVG(pressure_primary) as avg_primary, AVG(pressure_secondary) as avg_secondary, AVG(pressure_holding) as avg_holding"
+            else:
+                # daily_production/production_summary는 압력 데이터가 없음
+                return "SELECT *"
 
         # 유지보수 관련 집계
         elif any(kw in query_lower for kw in ["유지", "점검", "정비"]):
