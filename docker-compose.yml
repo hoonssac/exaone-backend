@@ -87,12 +87,12 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # Caddy (리버스 프록시 + 자동 HTTPS)
+  # Caddy (리버스 프록시)
   caddy:
     image: caddy:2-alpine
     container_name: exaone_caddy
     ports:
-      - "8443:443"
+      - "8080:8080"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
@@ -107,7 +107,7 @@ services:
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: exaone_cloudflared
-    command: tunnel run
+    command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
@@ -137,12 +137,6 @@ services:
       SUPERTONIC_INFERENCE_STEPS: 10
     volumes:
       - .:/app
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 60s
-      timeout: 30s
-      retries: 5
-      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy

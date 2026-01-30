@@ -5,7 +5,7 @@ injection_molding_machine, mold_info, material_spec, injection_cycle 등
 사출 성형 제조 시스템의 모든 테이블 정의
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, Date, DECIMAL, BigInteger, TINYINT, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, Date, DECIMAL, BigInteger, SmallInteger, ForeignKey
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from app.db.database import Base
@@ -159,8 +159,8 @@ class InjectionCycle(Base):
     mold_id = Column(Integer, ForeignKey("mold_info.id"), nullable=False, comment="금형 ID")
     material_id = Column(Integer, ForeignKey("material_spec.id"), nullable=False, comment="재료 ID")
     cycle_date = Column(Date, nullable=False, comment="사이클 실행 날짜")
-    cycle_hour = Column(TINYINT, nullable=False, comment="시간 (0-23)")
-    cycle_minute = Column(TINYINT, nullable=False, comment="분 (0-59)")
+    cycle_hour = Column(SmallInteger, nullable=False, comment="시간 (0-23)")
+    cycle_minute = Column(SmallInteger, nullable=False, comment="분 (0-59)")
     cycle_sequence = Column(Integer, nullable=False, comment="시간 내 순서")
 
     # 온도 데이터
@@ -204,7 +204,7 @@ class ProductionSummary(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True, comment="요약 ID")
     summary_date = Column(Date, nullable=False, comment="요약 날짜")
-    summary_hour = Column(TINYINT, nullable=False, comment="시간 (0-23)")
+    summary_hour = Column(SmallInteger, nullable=False, comment="시간 (0-23)")
     machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
     mold_id = Column(Integer, ForeignKey("mold_info.id"), nullable=False, comment="금형 ID")
 
@@ -316,7 +316,7 @@ class EnergyUsage(Base):
     machine_id = Column(Integer, ForeignKey("injection_molding_machine.id"), nullable=False, comment="설비 ID")
     energy_type = Column(String(20), comment="에너지 유형 (전력/냉각수)")
     usage_date = Column(Date, nullable=False, comment="사용 날짜")
-    usage_hour = Column(TINYINT, comment="시간 (0-23)")
+    usage_hour = Column(SmallInteger, comment="시간 (0-23)")
     consumption_value = Column(DECIMAL(12, 2), nullable=False, comment="사용량")
     unit = Column(String(10), comment="단위 (kWh/ton)")
     cost = Column(DECIMAL(10, 2), comment="비용 (원)")

@@ -1,3 +1,20 @@
+:8080 {
+    reverse_proxy fastapi:8080
+
+    # 로그 설정
+    log {
+        output stdout
+        format console
+    }
+
+    # 헤더 설정 (프록시 정보 전달)
+    header {
+        X-Real-IP {remote_host}
+        X-Forwarded-Proto {scheme}
+        X-Forwarded-For {remote_host}
+    }
+}
+
 dxs20.iptime.org:443 {
     reverse_proxy fastapi:8080
 

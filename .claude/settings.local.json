@@ -6,7 +6,12 @@
       "Bash(docker exec:*)",
       "Bash(docker logs:*)",
       "Bash(curl:*)",
-      "Bash(python -m py_compile:*)"
+      "Bash(python -m py_compile:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(python scripts/init_filterable_fields.py:*)",
+      "Bash(python -m uvicorn:*)",
+      "Bash(pip install:*)",
+      "Bash(python3:*)"
     ]
   }
 }

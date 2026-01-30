@@ -62,16 +62,18 @@ class ExaoneService:
         user_query: str,
         corrected_query: str,
         schema_info: Dict[str, Any],
-        knowledge_base: Optional[List[str]] = None
+        knowledge_base: Optional[List[str]] = None,
+        where_clause_hint: str = ""
     ) -> str:
         """
         자연어 질문을 SQL로 변환 (Mock 구현)
 
         Args:
             user_query: 원본 질문 (예: "오늘 생산량은?")
-            corrected_query: 보정된 질문 (용어 사전 적용)
+            corrected_query: 정규화된 질문
             schema_info: 스키마 메타데이터 (테이블, 컬럼 정보)
             knowledge_base: 도메인 지식 베이스
+            where_clause_hint: 엔티티 추출 기반 WHERE 절 힌트
 
         Returns:
             생성된 SQL 쿼리 문자열

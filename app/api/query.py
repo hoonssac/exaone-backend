@@ -147,8 +147,8 @@ async def process_query(
     - `500 Internal Server Error`: 서버 오류
     """
     try:
-        # 쿼리 처리
-        response = QueryService.process_query(
+        # 쿼리 처리 (에이전트 루프)
+        response = QueryService.process_query_agentic(
             db_postgres,
             db_mysql,
             user_id,
@@ -437,6 +437,9 @@ async def process_voice_query(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="음성에서 텍스트를 인식하지 못했습니다",
                 )
+
+            # STT 결과 교정 (발음 유사성 오류 교정)
+            recognized_text = QueryService._correct_stt_result(recognized_text)
 
             print(f"✅ STT 변환 완료: '{recognized_text}'")
 

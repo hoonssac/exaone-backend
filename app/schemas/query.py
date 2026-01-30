@@ -88,8 +88,8 @@ class QueryResponse(BaseModel):
         description="대화 쓰레드 ID",
         example=1
     )
-    message_id: int = Field(
-        ...,
+    message_id: Optional[int] = Field(
+        None,
         description="메시지 ID",
         example=1
     )
@@ -98,27 +98,27 @@ class QueryResponse(BaseModel):
         description="사용자가 입력한 원본 질문",
         example="오늘 생산량은?"
     )
-    corrected_message: str = Field(
-        ...,
+    corrected_message: Optional[str] = Field(
+        None,
         description="용어 사전으로 보정된 질문",
         example="CURDATE() 생산량은?"
     )
-    generated_sql: str = Field(
-        ...,
+    generated_sql: Optional[str] = Field(
+        None,
         description="생성된 SQL 쿼리",
         example="SELECT SUM(actual_quantity) as total FROM production_data WHERE production_date = CURDATE() LIMIT 100;"
     )
-    result_data: QueryResultData = Field(
-        ...,
+    result_data: Optional[QueryResultData] = Field(
+        None,
         description="SQL 실행 결과"
     )
-    execution_time: float = Field(
-        ...,
+    execution_time: Optional[float] = Field(
+        None,
         description="쿼리 실행 시간 (밀리초)",
         example=45.2
     )
-    natural_response: str = Field(
-        ...,
+    natural_response: Optional[str] = Field(
+        None,
         description="ChatGPT가 생성한 자연어 응답",
         example="오늘 총 생산량은 15,280개입니다."
     )

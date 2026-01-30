@@ -1,0 +1,7 @@
+tunnel: exaone
+credentials-file: /root/.cloudflared/cert.pem
+
+ingress:
+  - hostname: exaone.app
+    service: http://caddy:8080
+  - service: http_status:404

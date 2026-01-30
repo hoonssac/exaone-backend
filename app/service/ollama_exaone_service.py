@@ -28,16 +28,18 @@ class OllamaExaoneService:
         user_query: str,
         corrected_query: str,
         schema_info: Dict[str, Any],
-        knowledge_base: Optional[List[str]] = None
+        knowledge_base: Optional[List[str]] = None,
+        where_clause_hint: str = ""
     ) -> str:
         """
         Ollama 로컬 EXAONE으로 SQL 생성
 
         Args:
             user_query: 원본 질문 (예: "오늘 생산량은?")
-            corrected_query: 보정된 질문
+            corrected_query: 정규화된 질문
             schema_info: 스키마 메타데이터
             knowledge_base: 도메인 지식
+            where_clause_hint: 엔티티 추출 기반 WHERE 절 힌트 (예: "machine_id = '1' AND cycle_date = CURDATE()")
 
         Returns:
             생성된 SQL 쿼리
@@ -47,8 +49,10 @@ class OllamaExaoneService:
         """
         try:
             # 프롬프트 구성
+            # user_query에 대화 히스토리가 포함되면 그것을 사용, 아니면 corrected_query 사용
+            final_query = user_query if user_query else corrected_query
             prompt = OllamaExaoneService._build_prompt(
-                corrected_query, schema_info, knowledge_base
+                final_query, schema_info, knowledge_base, where_clause_hint
             )
 
             print(f"🔄 Ollama EXAONE 호출 중... (모델: {OllamaExaoneService.OLLAMA_MODEL})")
@@ -98,7 +102,8 @@ class OllamaExaoneService:
     def _build_prompt(
         user_query: str,
         schema_info: Dict[str, Any],
-        knowledge_base: Optional[List[str]] = None
+        knowledge_base: Optional[List[str]] = None,
+        where_clause_hint: str = ""
     ) -> str:
         """프롬프트 구성"""
         # 스키마 정보
@@ -146,31 +151,51 @@ class OllamaExaoneService:
 
 ## 예제 (사출 성형)
 
-질문: "오늘 생산량은?"
-SQL: SELECT COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date = CURDATE();
+질문: "생산량은?"
+SQL: SELECT COUNT(*) as total_cycles FROM injection_cycle;
 
-질문: "어제 불량은?"
-SQL: SELECT COUNT(*) as defect_count FROM injection_cycle WHERE cycle_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND has_defect = 1;
+질문: "불량은?"
+SQL: SELECT COUNT(*) as defect_count FROM injection_cycle WHERE has_defect = 1;
 
-질문: "1번 사출기 오늘 생산량은?"
-SQL: SELECT COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date = CURDATE() AND machine_id = 1;
+질문: "불량유형별 불량은?"
+SQL: SELECT defect_type_id, COUNT(*) as count FROM injection_cycle WHERE has_defect = 1 GROUP BY defect_type_id ORDER BY count DESC;
 
-질문: "어제 2호기 불량유형별 불량은?"
-SQL: SELECT defect_type_id, COUNT(*) as count FROM injection_cycle WHERE cycle_date = DATE_SUB(CURDATE(), INTERVAL 1 DAY) AND machine_id = 2 AND has_defect = 1 GROUP BY defect_type_id ORDER BY count DESC;
+질문: "불량률은?"
+SQL: SELECT ROUND(SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as defect_rate FROM injection_cycle;
 
-질문: "오늘 불량률은?"
-SQL: SELECT COUNT(*) as total, SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) as defect_count, ROUND(SUM(CASE WHEN has_defect = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as defect_rate FROM injection_cycle WHERE cycle_date = CURDATE();
+질문: "제품 무게 평균은?"
+SQL: SELECT AVG(product_weight_g) as avg_weight FROM injection_cycle;
 
-질문: "지난주 제품 무게 평균은?"
-SQL: SELECT AVG(product_weight_g) as avg_weight, MIN(product_weight_g) as min_weight, MAX(product_weight_g) as max_weight FROM injection_cycle WHERE cycle_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY);
-
-질문: "어제와 오늘 생산량을 비교해줘"
-SQL: SELECT cycle_date, COUNT(*) as total_cycles FROM injection_cycle WHERE cycle_date >= DATE_SUB(CURDATE(), INTERVAL 1 DAY) GROUP BY cycle_date ORDER BY cycle_date DESC;
-
-## 사용자 질문
+## 사용자 질문 또는 대화 내용
 "{user_query}"
+"""
 
-이 질문을 SQL로 변환하세요. SQL만 출력하고 설명은 포함하지 마세요."""
+        # WHERE 절 힌트가 있으면 추가
+        if where_clause_hint:
+            prompt += f"## 필터 조건 힌트 (자동 추출됨)\n{where_clause_hint}\n위 필터 조건을 포함하여 SQL을 작성하세요.\n\n"
+        else:
+            # WHERE 절이 없으면 사용자에게 물어보는 모드
+            prompt += """## ⚠️ 중요: 필터 조건이 부족합니다!
+
+질문에 필터 조건(사출기 번호, 날짜 등)이 명시되지 않으면:
+1. SQL을 생성하지 마세요
+2. 대신 사용자에게 명확하게 물어보세요
+3. 예: "어느 번호의 사출기를 조회하고 싶으신가요?"
+
+다음 필터 조건 중 누락된 것이 있으면 반드시 물어보세요:
+- 사출기 번호 (machine_id): 1번, 2번, 3번 등
+- 날짜 (cycle_date): 오늘, 어제, 특정 날짜 등
+- 금형 (mold_id): DC1, DC2 등 (선택사항)
+- 재료 (material_id): HIPS, PP 등 (선택사항)
+
+"""
+
+        prompt += """지시사항:
+- 대화 기록이 포함되어 있으면, 이전 맥락을 고려하여 SQL을 생성하세요.
+- 새로운 질문에서 필터 조건(날짜, 사출기, 라인 등)을 명시하지 않으면, 이전 대화에서 사용된 조건을 유지하세요.
+- 필터 조건 힌트가 제공되면 해당 조건을 포함하여 SQL을 작성하세요.
+- 필터 조건이 부족하면 SQL을 생성하지 말고 사용자에게 물어보세요.
+- SQL만 출력하고 설명은 포함하지 마세요."""
 
         return prompt
 
@@ -422,3 +447,60 @@ SQL: SELECT cycle_date, COUNT(*) as total_cycles FROM injection_cycle WHERE cycl
             print(f"⚠️ yes/no 판단 오류: {str(e)}")
             # 오류 시 yes로 (새로운 조회 필요)
             return "yes"
+
+    @staticmethod
+    def generate(prompt: str, temperature: float = 0.3, num_predict: int = 500) -> str:
+        """
+        Ollama EXAONE에 임의의 프롬프트를 보내고 응답을 생성합니다.
+
+        Agent나 일반 LLM 호출용 범용 메서드입니다.
+
+        Args:
+            prompt: 모델에 전달할 프롬프트
+            temperature: 응답 다양성 (0.0~1.0, 낮을수록 결정적)
+            num_predict: 최대 토큰 수
+
+        Returns:
+            생성된 응답 텍스트
+
+        Raises:
+            ValueError: Ollama 연결 실패 또는 응답 생성 오류
+        """
+        try:
+            print(f"🔄 Ollama EXAONE 호출 중... (모델: {OllamaExaoneService.OLLAMA_MODEL})")
+
+            response = requests.post(
+                f"{OllamaExaoneService.OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": OllamaExaoneService.OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "temperature": temperature,
+                    "stream": False,
+                    "num_predict": num_predict,
+                },
+                timeout=300,
+            )
+
+            if response.status_code != 200:
+                raise ValueError(f"Ollama API 오류: {response.status_code}")
+
+            result = response.json()
+            response_text = result.get("response", "").strip()
+
+            if not response_text:
+                raise ValueError("Ollama가 응답을 생성하지 못했습니다")
+
+            print(f"✅ Ollama EXAONE 응답 생성 성공")
+            print(f"   응답: {response_text[:100]}...")
+
+            return response_text
+
+        except requests.exceptions.ConnectionError:
+            raise ValueError(
+                f"Ollama 서버에 연결할 수 없습니다. ({OllamaExaoneService.OLLAMA_BASE_URL})\n"
+                "실행: ollama serve"
+            )
+        except requests.exceptions.Timeout:
+            raise ValueError("Ollama 요청 타임아웃 (설정된 시간 초과)")
+        except Exception as e:
+            raise ValueError(f"Ollama 응답 생성 오류: {str(e)}")

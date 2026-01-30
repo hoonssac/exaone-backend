@@ -13,6 +13,7 @@
 
 import time
 import json
+import re
 import requests
 from datetime import datetime
 from decimal import Decimal
@@ -21,17 +22,31 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text, func
 
 from app.schemas.query import QueryRequest, QueryResponse, QueryResultData
+from app.schemas.agent import AgentAction, AgentContext, AgentResponse
 from app.models.chat import ChatThread, ChatMessage
 from app.models.prompt import PromptDict, PromptKnowledge, PromptTable, PromptColumn
+from app.models.injection_molding import InjectionMoldingMachine
 from app.service.exaone_service import ExaoneService, ExaoneAPIService, ChatGPTService, GeminiService
 from app.service.ollama_exaone_service import OllamaExaoneService
 from app.service.rag_service import RAGService
 from app.service.schema_rag_service import SchemaRAGService
+from app.service.entity_extraction_service import EntityExtractionService
+from app.service.agent_service import AgentService
 from app.utils.sql_validator import SQLValidator
 
 
 class QueryService:
     """쿼리 처리 서비스 클래스"""
+
+    # STT 오류 교정 맵 (발음 유사성으로 인한 오류 교정)
+    STT_CORRECTION_MAP = {
+        "일본": "1번",           # 1번 → 일본
+        "이본": "1번",           # 1번 → 이본
+        "일불": "불량",         # 불량 → 일불
+        "양품": "양품",          # 양품 (정확함)
+        "지난주": "지난주",      # 지난주 (정확함)
+        "이번주": "이번주",      # 이번주 (정확함)
+    }
 
     # 극도로 주제 벗어난 키워드 (거절 대상)
     OUT_OF_SCOPE_KEYWORDS = [
@@ -190,7 +205,7 @@ class QueryService:
         lower_query = query.lower()
 
         # 자기소개 질문
-        if any(keyword in lower_query for keyword in ["누구야", "자기소개", "역할", "뭔가", "뭐야"]):
+        if any(keyword in lower_query for keyword in ["누구야", "자기소개", "역할", "뭔가"]):
             return """안녕하세요! 저는 EXAONE 제조 에이전트입니다.
 
 저는 생산 데이터를 기반으로:
@@ -230,6 +245,350 @@ class QueryService:
 무엇을 도와드릴까요?"""
 
         return None
+
+    @staticmethod
+    def get_conversation_history(db_postgres: Session, thread_id: int, max_messages: int = 10) -> str:
+        """
+        스레드의 대화 히스토리를 문자열로 반환
+
+        Args:
+            db_postgres: PostgreSQL 세션
+            thread_id: 스레드 ID
+            max_messages: 포함할 최대 메시지 수 (최근부터)
+
+        Returns:
+            포맷된 대화 히스토리 문자열
+        """
+        try:
+            # 최근 메시지부터 조회 (생성 시간 역순)
+            messages = db_postgres.query(ChatMessage).filter(
+                ChatMessage.thread_id == thread_id
+            ).order_by(ChatMessage.created_at.desc()).limit(max_messages).all()
+
+            # 시간순으로 정렬 (오래된 것부터)
+            messages = list(reversed(messages))
+
+            if not messages:
+                return ""
+
+            # 대화 히스토리 포맷팅
+            history = ""
+            for msg in messages:
+                role = "사용자" if msg.role == "user" else "챗봇"
+                history += f"{role}: {msg.message}\n"
+
+            return history.strip()
+        except Exception as e:
+            print(f"⚠️ 대화 히스토리 조회 오류: {str(e)}")
+            return ""
+
+    @staticmethod
+    def process_query_agentic(
+        db_postgres: Session,
+        db_mysql: Session,
+        user_id: int,
+        request: QueryRequest
+    ) -> QueryResponse:
+        """
+        에이전트 루프로 쿼리 처리
+
+        EXAONE에게 반복적으로 다음 액션을 결정하도록 함:
+        1. query_machines: 사용 가능한 기계 조회
+        2. query_production: SQL 실행
+        3. ask_clarification: 사용자에게 재질문
+        4. return_answer: 최종 답변
+
+        Args:
+            db_postgres: PostgreSQL 세션
+            db_mysql: MySQL 세션
+            user_id: 사용자 ID
+            request: 쿼리 요청
+
+        Returns:
+            QueryResponse
+        """
+        start_time = time.time()
+
+        try:
+            # 쓰레드 생성/조회
+            if request.thread_id:
+                thread = db_postgres.query(ChatThread).filter(
+                    ChatThread.id == request.thread_id,
+                    ChatThread.user_id == user_id
+                ).first()
+                if not thread:
+                    raise ValueError("스레드를 찾을 수 없습니다")
+            else:
+                thread = QueryService._get_or_create_thread(
+                    db_postgres, user_id, request.message
+                )
+
+            print(f"🤖 에이전트 루프 시작: {request.message[:50]}...")
+
+            # 대화 히스토리 조회 (맥락 이해용)
+            conversation_history = QueryService.get_conversation_history(
+                db_postgres,
+                thread_id=thread.id,
+                max_messages=10
+            )
+            if conversation_history:
+                print(f"🔗 대화 히스토리 조회 완료")
+                print(f"   최근 대화:\n{conversation_history[:200]}...")
+
+            # 사용자 메시지에서 엔티티 추출 (FilterableFields 적용)
+            extracted_entities = EntityExtractionService.extract_entities(
+                request.message,
+                db_postgres
+            )
+            print(f"📋 추출된 엔티티: {extracted_entities}")
+
+            # 현재 질문에서 필터가 부족하면 이전 대화에서 찾기
+            if conversation_history:
+                missing_filters = []
+                if "machine_id" not in extracted_entities or not extracted_entities["machine_id"]:
+                    missing_filters.append("machine_id")
+                if "cycle_date" not in extracted_entities or not extracted_entities["cycle_date"]:
+                    missing_filters.append("cycle_date")
+
+                # 이전 대화에서 필터 정보 추출
+                if missing_filters:
+                    previous_entities = EntityExtractionService.extract_entities(
+                        conversation_history,  # 이전 대화에서도 추출
+                        db_postgres
+                    )
+                    print(f"📍 이전 대화에서 추출된 엔티티: {previous_entities}")
+
+                    # 현재 질문에 없는 필터를 이전 대화에서 채우기
+                    for filter_key in missing_filters:
+                        if filter_key in previous_entities and previous_entities[filter_key]:
+                            extracted_entities[filter_key] = previous_entities[filter_key]
+                            print(f"  ✅ {filter_key}: 이전 대화에서 보충 = {previous_entities[filter_key]}")
+
+            print(f"📋 최종 엔티티 (대화맥락 적용): {extracted_entities}")
+
+            # 에이전트 컨텍스트 초기화
+            context = AgentContext(
+                user_message=request.message,
+                extracted_info=extracted_entities,
+                available_entities={},
+                previous_result=None,
+                iteration=0,
+                max_iterations=5,
+                conversation_history=conversation_history,
+            )
+
+            # 에이전트 루프
+            while context.iteration < context.max_iterations:
+                context.iteration += 1
+                print(f"\n[에이전트 반복 {context.iteration}/{context.max_iterations}]")
+
+                # 2번째 반복 이상이고 이미 결과가 있으면 answer 반환 (쿼리 반복 방지)
+                if context.iteration >= 2 and context.previous_result and context.previous_result.get("row_count", 0) > 0:
+                    print(f"→ 이미 조회 완료 (2번째 반복 + 결과 있음) → answer 생성")
+
+                    # 쿼리 결과를 기반으로 답변 생성
+                    answer_text = QueryService._generate_answer_from_result(
+                        context.user_message,
+                        context.previous_result,
+                        context.extracted_info
+                    )
+
+                    agent_response = AgentResponse(
+                        action=AgentAction.RETURN_ANSWER,
+                        reasoning="이미 조회 결과가 있으므로 답변 제공",
+                        answer=answer_text
+                    )
+                else:
+                    # EXAONE 호출하여 다음 액션 결정
+                    agent_response = AgentService.call_ollama_agent(context)
+
+                # 액션별 처리
+                if agent_response.action == AgentAction.QUERY_ENTITIES:
+                    print(f"→ 엔티티 조회 중: {agent_response.entities_to_query}")
+
+                    # 모든 가능한 엔티티 로드 (첫 번째는 전체 로드, 이후는 특정 엔티티만)
+                    if not context.available_entities:
+                        context.available_entities = AgentService.get_available_entities(db_postgres, db_mysql)
+
+                    # 필요한 엔티티만 기록
+                    queried_entities = {}
+                    if agent_response.entities_to_query:
+                        for entity_type in agent_response.entities_to_query:
+                            if entity_type in context.available_entities:
+                                queried_entities[entity_type] = context.available_entities[entity_type]
+
+                    context.history.append({
+                        "step": context.iteration,
+                        "action": "query_entities",
+                        "entities": agent_response.entities_to_query,
+                        "result": queried_entities
+                    })
+                    print(f"✅ 엔티티 조회 완료: {list(queried_entities.keys())}")
+                    continue
+
+                elif agent_response.action == AgentAction.QUERY_PRODUCTION:
+                    print(f"→ SQL 실행 중: {agent_response.sql[:100]}...")
+                    try:
+                        result = db_mysql.execute(text(agent_response.sql))
+                        rows = result.fetchall()
+
+                        # 컬럼명과 데이터 추출
+                        if rows:
+                            columns = list(rows[0]._mapping.keys())
+                            rows_dict = [dict(row._mapping) for row in rows]
+                        else:
+                            columns = []
+                            rows_dict = []
+
+                        context.previous_result = {
+                            "columns": columns,
+                            "rows": rows_dict,
+                            "row_count": len(rows_dict)
+                        }
+                        context.history.append({
+                            "step": context.iteration,
+                            "action": "query_production",
+                            "sql": agent_response.sql,
+                            "result": context.previous_result
+                        })
+                        print(f"✅ SQL 실행 완료: {len(rows)}개 행")
+                    except Exception as e:
+                        print(f"❌ SQL 실행 오류: {str(e)}")
+                        context.previous_result = {"error": str(e)}
+                    continue
+
+                elif agent_response.action == AgentAction.ASK_CLARIFICATION:
+                    print(f"→ 사용자에게 재질문")
+                    # 사용자 메시지 저장
+                    user_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="user",
+                        message=request.message,
+                        context_tag=request.context_tag,
+                    )
+                    db_postgres.add(user_msg)
+                    db_postgres.flush()
+
+                    # 챗봇 질문 저장
+                    assistant_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="assistant",
+                        message=agent_response.message,
+                    )
+                    db_postgres.add(assistant_msg)
+                    db_postgres.commit()
+
+                    execution_time = (time.time() - start_time) * 1000
+                    response = QueryResponse(
+                        thread_id=thread.id,
+                        message_id=None,
+                        original_message=request.message,
+                        corrected_message=request.message,
+                        generated_sql=None,
+                        result_data=None,
+                        execution_time=execution_time,
+                        natural_response=agent_response.message,
+                        created_at=datetime.now()
+                    )
+                    print(f"✅ 에이전트 루프 완료 (clarification)")
+                    return response
+
+                elif agent_response.action == AgentAction.RETURN_ANSWER:
+                    print(f"→ 최종 답변 반환")
+
+                    # 템플릿 답변의 플레이스홀더를 실제 데이터로 교체
+                    final_answer = QueryService._fix_template_answer(
+                        agent_response.answer,
+                        context.previous_result,
+                        context.user_message,
+                        context.extracted_info
+                    )
+
+                    # 사용자 메시지 저장
+                    user_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="user",
+                        message=request.message,
+                        context_tag=request.context_tag,
+                    )
+                    db_postgres.add(user_msg)
+                    db_postgres.flush()
+
+                    # 챗봇 답변 저장
+                    assistant_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="assistant",
+                        message=final_answer,
+                    )
+                    db_postgres.add(assistant_msg)
+                    db_postgres.commit()
+
+                    execution_time = (time.time() - start_time) * 1000
+
+                    # result_data 구성
+                    result_data = None
+                    if context.previous_result and "error" not in context.previous_result:
+                        result_data = QueryResultData(
+                            columns=context.previous_result.get("columns", []),
+                            rows=context.previous_result.get("rows", []),
+                            row_count=context.previous_result.get("row_count", 0)
+                        )
+
+                    response = QueryResponse(
+                        thread_id=thread.id,
+                        message_id=user_msg.id,
+                        original_message=request.message,
+                        corrected_message=request.message,
+                        generated_sql=context.history[-1]["sql"] if context.history and context.history[-1].get("sql") else None,
+                        result_data=result_data,
+                        execution_time=execution_time,
+                        natural_response=final_answer,
+                        created_at=datetime.now()
+                    )
+                    print(f"✅ 에이전트 루프 완료 (answer)")
+                    return response
+
+            # 최대 반복 초과
+            error_msg = "에이전트가 결정을 내리지 못했습니다"
+            print(f"❌ {error_msg}")
+            raise ValueError(error_msg)
+
+        except Exception as e:
+            print(f"❌ 에이전트 처리 오류: {str(e)}")
+            error_response = f"쿼리 처리 중 오류: {str(e)}"
+
+            try:
+                if 'thread' in locals():
+                    user_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="user",
+                        message=request.message,
+                        context_tag=request.context_tag,
+                    )
+                    db_postgres.add(user_msg)
+
+                    assistant_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="assistant",
+                        message=error_response,
+                    )
+                    db_postgres.add(assistant_msg)
+                    db_postgres.commit()
+            except:
+                pass
+
+            execution_time = (time.time() - start_time) * 1000
+            return QueryResponse(
+                thread_id=thread.id if 'thread' in locals() else None,
+                message_id=None,
+                original_message=request.message,
+                corrected_message=request.message,
+                generated_sql=None,
+                result_data=None,
+                execution_time=execution_time,
+                natural_response=error_response,
+                created_at=datetime.now()
+            )
 
     @staticmethod
     def process_query(
@@ -497,17 +856,82 @@ class QueryService:
 
             print(f"✅ SQL 필요 질문 확인")
 
-            # 5. 질문 강화 (이전 질문의 날짜/기간 정보 포함) - 가장 먼저!
-            enhanced_message = QueryService.enhance_query_with_context(
-                current_query=request.message,
-                previous_query=previous_query
+            # 5. 대화 히스토리 조회 (전체 맥락 파악용)
+            conversation_history = QueryService.get_conversation_history(
+                db_postgres,
+                thread_id=thread.id,
+                max_messages=10
             )
-            if enhanced_message != request.message:
-                print(f"🔗 질문 컨텍스트 강화 완료: '{enhanced_message}'")
+            if conversation_history:
+                print(f"🔗 대화 히스토리 조회 완료 (10개 메시지)")
 
-            # 6. 질문 보정 (용어 사전) - 강화된 메시지 기반
-            corrected_message = QueryService.correct_message(
-                enhanced_message,  # 강화된 메시지 보정
+            # 6. 엔티티 추출 (FilterableField 규칙 기반) - 원본 메시지 사용
+            # ⚠️ 정규화 전 원본 메시지에서 추출해야 숫자나 키워드가 손실되지 않음
+            entities = EntityExtractionService.extract_entities(
+                request.message,
+                db_postgres
+            )
+            where_clause_hint = EntityExtractionService.build_where_clause(entities)
+            if where_clause_hint:
+                print(f"📌 추출된 WHERE 절: {where_clause_hint}")
+
+            # 6.2. 필수 필터 조건 확인 (machine_id 필수)
+            # machine_id가 없으면 대화 히스토리에서 가장 최근의 machine_id 찾기
+            if "machine_id" not in entities or not entities.get("machine_id"):
+                # 대화 히스토리에서 마지막 machine_id 추출
+                if conversation_history:
+                    # 대화에서 숫자 + "번" 패턴 찾기 (예: "1번 사출기")
+                    import re
+                    machine_pattern = r'(\d+)번\s*(?:사출기|라인)'
+                    matches = re.findall(machine_pattern, conversation_history)
+                    if matches:
+                        last_machine_id = matches[-1]  # 가장 최근 것 사용
+                        entities["machine_id"] = last_machine_id
+                        print(f"✅ 대화 히스토리에서 machine_id 복구: {last_machine_id}번")
+
+            # machine_id 재확인 (여전히 없으면 사용자에게 물어보기)
+            if "machine_id" not in entities or not entities.get("machine_id"):
+                print(f"❓ 필수 필터 누락: machine_id 없음 - 사용자에게 질문 중...")
+                natural_response = "어느 번호의 사출기를 조회하고 싶으신가요? (예: 1번, 2번, 3번...)"
+
+                # 사용자 메시지 저장
+                message = ChatMessage(
+                    thread_id=thread.id,
+                    role="user",
+                    message=request.message,
+                    context_tag=request.context_tag,
+                )
+                db_postgres.add(message)
+                db_postgres.flush()
+                message_id = message.id
+
+                # 챗봇 질문 저장
+                assistant_message = ChatMessage(
+                    thread_id=thread.id,
+                    role="assistant",
+                    message=natural_response
+                )
+                db_postgres.add(assistant_message)
+                db_postgres.commit()
+
+                # 응답 반환
+                execution_time = (time.time() - start_time) * 1000
+                response = QueryResponse(
+                    thread_id=thread.id,
+                    message_id=message_id,
+                    original_message=request.message,
+                    corrected_message=None,
+                    generated_sql=None,
+                    result_data=None,
+                    execution_time=execution_time,
+                    natural_response=natural_response,
+                    created_at=datetime.now()
+                )
+                return response
+
+            # 6.5. 질문 정규화 (용어 사전) - 원본 메시지 기반
+            normalized_message = QueryService.normalize_message(
+                request.message,  # 원본 메시지 정규화
                 db_postgres
             )
 
@@ -521,12 +945,12 @@ class QueryService:
             rag_context = []
             schema_hint = ""
 
-            # 9-1. Conversation RAG: 이전 대화 검색 - 강화된 메시지 사용
+            # 9-1. Conversation RAG: 이전 대화 검색 - 원본 메시지 사용
             try:
                 rag_context = RAGService.retrieve_context(
                     db_postgres,
                     thread_id=thread.id,
-                    query=enhanced_message,  # 강화된 메시지 사용
+                    query=request.message,  # 원본 메시지 사용
                     top_k=3
                 )
                 if rag_context:
@@ -535,11 +959,11 @@ class QueryService:
                 print(f"⚠️ Conversation RAG 검색 실패: {str(rag_error)}")
                 rag_context = []
 
-            # 9-2. Schema RAG: 스키마 기반 검색 (테이블/컬럼 자동 매핑) - 강화된 메시지 사용
+            # 9-2. Schema RAG: 스키마 기반 검색 (테이블/컬럼 자동 매핑) - 원본 메시지 사용
             try:
                 schema_results = SchemaRAGService.search_similar_schema(
                     db_postgres,
-                    query=enhanced_message,  # 강화된 메시지 사용!
+                    query=request.message,  # 원본 메시지 사용
                     top_k=5
                 )
                 if schema_results:
@@ -556,33 +980,32 @@ class QueryService:
             try:
                 print(f"🔄 [1단계] Ollama EXAONE SQL 생성 중...")
 
-                # 통합 프롬프트 구성: Conversation RAG + Schema RAG
-                api_query = enhanced_message  # 강화된 질문 사용
+                # 통합 프롬프트 구성: 대화 히스토리 + Schema RAG
+                api_query = request.message  # 원본 질문 사용
 
-                # Conversation RAG 컨텍스트 추가
-                if rag_context:
-                    rag_prompt = RAGService.build_rag_prompt(
-                        user_query=enhanced_message,  # 강화된 질문 사용
-                        context=rag_context,
-                        schema_info=schema_info
-                    )
-                    api_query = rag_prompt
-                    print(f"💬 이전 대화 컨텍스트 추가됨")
+                # 대화 히스토리 포함 (전체 맥락 이해)
+                if conversation_history:
+                    api_query = f"""대화 기록:
+{conversation_history}
+
+새로운 질문: {request.message}"""
+                    print(f"💬 대화 히스토리 포함 (전체 맥락 이해)")
 
                 # Schema RAG 힌트 추가
                 if schema_hint:
-                    if api_query == enhanced_message:  # enhanced_message와 비교
-                        api_query = schema_hint + "\n질문: " + enhanced_message
+                    if conversation_history:
+                        api_query = api_query + "\n\n" + schema_hint
                     else:
-                        api_query = schema_hint + "\n" + api_query
+                        api_query = schema_hint + "\n질문: " + request.message
                     print(f"🗂️ 스키마 힌트 추가됨")
 
                 print(f"📤 Ollama EXAONE에 전달할 질문:\n{api_query[:200]}...")
                 generated_sql = OllamaExaoneService.nl_to_sql(
                     user_query=api_query,
-                    corrected_query=corrected_message,
+                    corrected_query=normalized_message,
                     schema_info=schema_info,
-                    knowledge_base=knowledge_base
+                    knowledge_base=knowledge_base,
+                    where_clause_hint=where_clause_hint
                 )
 
                 print(f"✅ Ollama EXAONE SQL 생성 성공")
@@ -590,45 +1013,61 @@ class QueryService:
                 print(f"⚠️ Ollama EXAONE 오류 ({str(ollama_error)}), Mock으로 폴백...")
                 try:
                     generated_sql = ExaoneService.nl_to_sql(
-                        user_query=enhanced_message,  # 강화된 메시지 사용
-                        corrected_query=corrected_message,
+                        user_query=request.message,  # 원본 메시지 사용
+                        corrected_query=normalized_message,
                         schema_info=schema_info,
-                        knowledge_base=knowledge_base
+                        knowledge_base=knowledge_base,
+                        where_clause_hint=where_clause_hint
                     )
                     print(f"✅ Mock 방식 사용")
                 except Exception as mock_error:
                     raise ValueError(f"SQL 생성 실패 (Ollama: {ollama_error}, Mock: {mock_error})")
 
-            # 8. SQL 검증
-            is_valid, error_msg = SQLValidator.validate(generated_sql)
-            if not is_valid:
-                raise ValueError(f"SQL 검증 실패: {error_msg}")
+            # 11. 생성된 결과가 SQL인지 질문인지 판단
+            is_sql = "SELECT" in generated_sql.upper().strip()
 
-            # SQL 정제 (LIMIT 추가 등)
-            sanitized_sql = SQLValidator.sanitize(generated_sql)
+            if not is_sql:
+                # SQL이 아니라 사용자에게 하는 질문 (필터 조건 부족)
+                print(f"❓ 필터 조건 부족 - 사용자에게 질문 중: {generated_sql[:100]}...")
+                natural_response = generated_sql  # 직접 질문을 응답으로 사용
+                result_data_dict = None
+                sanitized_sql = None
+            else:
+                # SQL 검증
+                is_valid, error_msg = SQLValidator.validate(generated_sql)
+                if not is_valid:
+                    raise ValueError(f"SQL 검증 실패: {error_msg}")
 
-            # 11. MySQL에서 쿼리 실행
-            result_data = QueryService.execute_query(db_mysql, sanitized_sql)
+                # SQL 정제 (LIMIT 추가 등)
+                sanitized_sql = SQLValidator.sanitize(generated_sql)
 
-            # 12. [2단계] 자연어 응답 생성
-            print(f"🔄 [2단계] Ollama EXAONE 자연어 응답 생성 중...")
-            try:
-                result_data_for_llm = {
-                    "columns": result_data.columns,
-                    "rows": result_data.rows,
-                    "row_count": result_data.row_count
-                }
-                natural_response = OllamaExaoneService.generate_response(
-                    user_query=request.message,
-                    sql_result=result_data_for_llm
-                )
-                print(f"✅ Ollama EXAONE 자연어 응답 생성 성공")
-            except Exception as response_error:
-                print(f"⚠️ 자연어 응답 생성 실패: {str(response_error)}")
-                # 응답 생성 실패 시 기본 응답 사용
-                natural_response = f"데이터 조회 완료: {result_data.row_count}행 반환되었습니다."
+                # 12. MySQL에서 쿼리 실행
+                result_data = QueryService.execute_query(db_mysql, sanitized_sql)
 
-            # 13. 대화 기록 저장
+            # SQL일 때만 자연어 응답 생성
+            if is_sql:
+                # 13. [2단계] 자연어 응답 생성
+                print(f"🔄 [2단계] Ollama EXAONE 자연어 응답 생성 중...")
+                try:
+                    result_data_for_llm = {
+                        "columns": result_data.columns,
+                        "rows": result_data.rows,
+                        "row_count": result_data.row_count
+                    }
+                    natural_response = OllamaExaoneService.generate_response(
+                        user_query=request.message,
+                        sql_result=result_data_for_llm
+                    )
+                    print(f"✅ Ollama EXAONE 자연어 응답 생성 성공")
+                except Exception as response_error:
+                    print(f"⚠️ 자연어 응답 생성 실패: {str(response_error)}")
+                    # 응답 생성 실패 시 기본 응답 사용
+                    natural_response = f"데이터 조회 완료: {result_data.row_count}행 반환되었습니다."
+            else:
+                # SQL이 아닐 때는 이미 natural_response가 설정됨
+                print(f"💬 사용자 입력 필요 응답 준비 완료")
+
+            # 14. 대화 기록 저장
             message = ChatMessage(
                 thread_id=thread.id,
                 role="user",
@@ -640,24 +1079,29 @@ class QueryService:
             message_id = message.id
 
             # Assistant 응답 메시지 저장 (자연어 응답)
-            result_data_dict = {
-                "columns": result_data.columns,
-                "rows": result_data.rows,
-                "row_count": result_data.row_count
-            }
+            if is_sql:
+                # SQL 실행 결과 저장
+                result_data_dict = {
+                    "columns": result_data.columns,
+                    "rows": result_data.rows,
+                    "row_count": result_data.row_count
+                }
+            else:
+                # 사용자 질문 (SQL 없음)
+                result_data_dict = None
 
             assistant_message = ChatMessage(
                 thread_id=thread.id,
                 role="assistant",
                 message=natural_response,  # AI가 생성한 자연어 응답
-                corrected_msg=corrected_message,
-                gen_sql=sanitized_sql,
+                corrected_msg=normalized_message if is_sql else None,
+                gen_sql=sanitized_sql if is_sql else None,
                 result_data=result_data_dict
             )
             db_postgres.add(assistant_message)
             db_postgres.commit()
 
-            # 12. RAG 임베딩 저장 (비동기)
+            # 15. RAG 임베딩 저장 (비동기)
             try:
                 # 사용자 메시지 임베딩
                 RAGService.store_embedding(
@@ -667,27 +1111,41 @@ class QueryService:
                 )
 
                 # Assistant 응답 임베딩 (자연어 응답)
-                RAGService.store_embedding(
-                    db_postgres,
-                    thread_id=thread.id,
-                    message=natural_response,
-                    result_data=result_data_dict
-                )
+                if is_sql:
+                    RAGService.store_embedding(
+                        db_postgres,
+                        thread_id=thread.id,
+                        message=natural_response,
+                        result_data=result_data_dict
+                    )
+                else:
+                    # 사용자 질문일 때는 result_data 없이 저장
+                    RAGService.store_embedding(
+                        db_postgres,
+                        thread_id=thread.id,
+                        message=natural_response
+                    )
                 print(f"✅ RAG 임베딩 저장 완료")
             except Exception as embedding_error:
                 print(f"⚠️ RAG 임베딩 저장 실패: {str(embedding_error)}")
                 # 임베딩 저장 실패해도 쿼리 결과는 반환
 
-            # 13. 응답 구성
+            # 16. 응답 구성
             execution_time = (time.time() - start_time) * 1000  # 밀리초
+
+            # SQL일 때만 result_data 포함
+            if is_sql:
+                result_data_response = result_data
+            else:
+                result_data_response = None
 
             response = QueryResponse(
                 thread_id=thread.id,
                 message_id=message_id,
                 original_message=request.message,
-                corrected_message=corrected_message,
-                generated_sql=sanitized_sql,
-                result_data=result_data,
+                corrected_message=normalized_message if is_sql else None,
+                generated_sql=sanitized_sql if is_sql else None,
+                result_data=result_data_response,
                 execution_time=execution_time,
                 natural_response=natural_response,
                 created_at=datetime.now()
@@ -703,96 +1161,56 @@ class QueryService:
             raise Exception(f"쿼리 처리 중 오류: {str(e)}")
 
     @staticmethod
-    def extract_date_from_query(query: str) -> Optional[str]:
+    def normalize_message(message: str, db: Session) -> str:
         """
-        질문에서 날짜/기간 정보 추출
+        용어 사전을 이용하여 질문 정규화
 
-        예: "2026년 1월 11일" "어제" "지난주" "오늘" 등
-
-        Args:
-            query: 사용자 질문
-
-        Returns:
-            추출된 날짜 문자열, 없으면 None
-        """
-        import re
-
-        # 연-월-일 형식
-        date_patterns = [
-            r'\d{4}년\s*\d{1,2}월\s*\d{1,2}일',  # 2026년 1월 11일
-            r'\d{4}-\d{1,2}-\d{1,2}',             # 2026-01-11
-        ]
-
-        for pattern in date_patterns:
-            match = re.search(pattern, query)
-            if match:
-                return match.group(0)
-
-        # 상대적 날짜 표현
-        relative_dates = {
-            '오늘': '오늘',
-            '어제': '어제',
-            '내일': '내일',
-            '모레': '모레',
-            '그저께': '그저께',
-            '재어제': '재어제',
-            '지난주': '지난주',
-            '이번주': '이번주',
-            '지난달': '지난달',
-            '이번달': '이번달',
-        }
-
-        for date_term, date_value in relative_dates.items():
-            if date_term in query:
-                return date_value
-
-        return None
-
-    @staticmethod
-    def enhance_query_with_context(current_query: str, previous_query: Optional[str]) -> str:
-        """
-        이전 질문의 날짜 정보를 현재 질문에 포함시킴
+        사용자의 다양한 표현을 정규화된 용어로 통일합니다.
+        SQL 함수나 조건은 생성하지 않습니다.
 
         예:
-        - 이전: "2026년 1월 11일 생산량 알려줘"
-        - 현재: "불량률은?"
-        - 결과: "2026년 1월 11일의 불량률은?"
+        - "1번" → "사출기"
+        - "1호기" → "사출기"
+        - "생산" → "생산량"
+        - "불량" → "불량률"
 
         Args:
-            current_query: 현재 사용자 질문
-            previous_query: 이전 사용자 질문
+            message: 원본 질문
+            db: PostgreSQL 세션
 
         Returns:
-            강화된 질문
+            정규화된 질문
         """
-        if not previous_query:
-            return current_query
+        normalized = message
 
-        extracted_date = QueryService.extract_date_from_query(previous_query)
-        if not extracted_date:
-            return current_query
+        try:
+            # 용어 사전 조회
+            term_dicts = db.query(PromptDict).all()
 
-        # 현재 질문에 날짜가 이미 있으면 그대로 반환
-        if QueryService.extract_date_from_query(current_query):
-            return current_query
+            for term_dict in term_dicts:
+                # 대소문자 무시하고 단어 전체 매칭
+                pattern = rf'\b{re.escape(term_dict.key)}\b'
+                normalized = re.sub(
+                    pattern,
+                    term_dict.value,
+                    normalized,
+                    flags=re.IGNORECASE
+                )
 
-        # 간단한 질문("불량률은?", "온도는?" 등)에 날짜 추가
-        if len(current_query) < 20 and current_query.strip().endswith('?'):
-            enhanced = f"{extracted_date}의 {current_query}"
-            print(f"✅ 질문 강화: '{current_query}' → '{enhanced}'")
-            return enhanced
+        except Exception as e:
+            print(f"⚠️ 정규화 오류: {str(e)}")
+            # 정규화 실패 시 원본 반환
+            return message
 
-        return current_query
+        return normalized
 
     @staticmethod
     def correct_message(message: str, db: Session) -> str:
         """
-        용어 사전을 이용하여 질문 보정
+        용어 사전을 이용하여 질문 보정 (레거시)
 
-        예:
-        - "오늘" → "CURDATE()"
-        - "어제" → "DATE_SUB(CURDATE(), INTERVAL 1 DAY)"
-        - "Loading" → "로딩기"
+        NOTE: normalize_message()로 교체될 예정입니다.
+        현재는 호환성 유지를 위해 남겨둡니다.
 
         Args:
             message: 원본 질문
@@ -801,29 +1219,8 @@ class QueryService:
         Returns:
             보정된 질문
         """
-        corrected = message
-
-        try:
-            # 용어 사전 조회
-            term_dicts = db.query(PromptDict).all()
-
-            for term_dict in term_dicts:
-                # 대소문자 무시하고 단어 전체 매칭
-                import re
-                pattern = rf'\b{re.escape(term_dict.key)}\b'
-                corrected = re.sub(
-                    pattern,
-                    term_dict.value,
-                    corrected,
-                    flags=re.IGNORECASE
-                )
-
-        except Exception as e:
-            print(f"⚠️ 용어 사전 보정 오류: {str(e)}")
-            # 보정 실패 시 원본 반환
-            return message
-
-        return corrected
+        # normalize_message()와 동일하게 동작
+        return QueryService.normalize_message(message, db)
 
     @staticmethod
     def get_schema_info(db_postgres: Session, db_mysql: Session) -> Dict[str, Any]:
@@ -1154,3 +1551,462 @@ class QueryService:
         except Exception as e:
             db.rollback()
             raise Exception(f"쓰레드 삭제 오류: {str(e)}")
+
+    @staticmethod
+    def _correct_stt_result(text: str) -> str:
+        """
+        STT 결과를 도메인 어휘로 교정합니다.
+
+        발음 유사성으로 인한 오류를 자동으로 교정합니다.
+        예: "일본" → "1번", "이본" → "2번", "삼본" → "3번", "사본" → "4번"
+
+        Args:
+            text: STT 인식 결과 텍스트
+
+        Returns:
+            교정된 텍스트
+        """
+        corrected_text = text
+
+        # 한글 숫자를 아라비아 숫자로 변환 (본/번 패턴)
+        korean_to_arabic = {
+            "일본": "1번",   # 일 → 1, 본 → 번
+            "이본": "2번",   # 이 → 2, 본 → 번
+            "삼본": "3번",   # 삼 → 3, 본 → 번
+            "사본": "4번",   # 사 → 4, 본 → 번
+            "오본": "5번",   # 오 → 5, 본 → 번
+            "육본": "6번",   # 육 → 6, 본 → 번
+            "칠본": "7번",   # 칠 → 7, 본 → 번
+            "팔본": "8번",   # 팔 → 8, 본 → 번
+            "구본": "9번",   # 구 → 9, 본 → 번
+        }
+
+        # 본 → 번 교정 (일반적인 패턴)
+        for korean, arabic in korean_to_arabic.items():
+            if korean in corrected_text:
+                corrected_text = corrected_text.replace(korean, arabic)
+                print(f"🔧 STT 교정: '{korean}' → '{arabic}'")
+
+        # 추가 교정: "본"으로 끝나는데 숫자로 시작하는 경우
+        # 예: "사본" → "4번" (위에서 처리됨)
+
+        # 기타 일반적인 오류
+        other_corrections = [
+            ("일불", "불량"),         # 불량 인식 오류
+            ("일불품", "불량품"),     # 불량품 인식 오류
+        ]
+
+        for wrong, correct in other_corrections:
+            if wrong in corrected_text:
+                corrected_text = corrected_text.replace(wrong, correct)
+                print(f"🔧 STT 교정: '{wrong}' → '{correct}'")
+
+        return corrected_text
+
+    @staticmethod
+    def _fix_template_answer(answer: str, previous_result: Dict[str, Any], user_message: str, extracted_info: Dict[str, Any]) -> str:
+        """
+        Agent가 생성한 템플릿 답변의 플레이스홀더를 실제 데이터로 교체
+
+        Args:
+            answer: Agent가 생성한 답변 (플레이스홀더 포함 가능)
+            previous_result: SQL 실행 결과
+            user_message: 사용자의 원본 메시지
+            extracted_info: 추출된 엔티티 정보
+
+        Returns:
+            플레이스홀더가 실제 값으로 교체된 답변
+        """
+        # 플레이스홀더가 없으면 그대로 반환
+        if not any(placeholder in answer for placeholder in ['[', ']', '(', ')']):
+            return answer
+
+        try:
+            if not previous_result or previous_result.get("error") or not previous_result.get("rows"):
+                # 결과가 없으면 원본 답변 반환
+                return answer
+
+            # 첫 번째 행의 데이터 추출
+            row_data = previous_result["rows"][0]
+
+            # 값 추출
+            value = None
+            for col_name, col_value in row_data.items():
+                if col_value is not None:
+                    try:
+                        value = float(col_value)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
+            if value is None:
+                return answer
+
+            # 값 포매팅
+            value_int = int(value)
+            value_formatted = f"{value_int:,}"
+
+            # 플레이스홀더 교체
+            fixed_answer = answer
+
+            # 일반적인 플레이스홀더 패턴 교체
+            fixed_answer = fixed_answer.replace('[불량 개수]', f'{value_int}개')
+            fixed_answer = fixed_answer.replace('[불량]', f'{value_int}개')
+            fixed_answer = fixed_answer.replace('[양품 개수]', f'{value_int}개')
+            fixed_answer = fixed_answer.replace('[양품]', f'{value_int}개')
+            fixed_answer = fixed_answer.replace('[생산량]', f'{value_formatted}개')
+            fixed_answer = fixed_answer.replace('[개수]', f'{value_int}개')
+
+            # 괄호 형태의 플레이스홀더도 처리
+            fixed_answer = fixed_answer.replace('(불량 개수)', f'{value_int}개')
+            fixed_answer = fixed_answer.replace('(개수)', f'{value_int}개')
+
+            # 말줄임표와 함께 있는 경우 정리
+            fixed_answer = fixed_answer.replace('....', '.')
+            fixed_answer = fixed_answer.rstrip('.')  + '.'
+
+            return fixed_answer
+
+        except Exception as e:
+            print(f"⚠️ 템플릿 답변 교정 오류: {str(e)}")
+            return answer
+
+    @staticmethod
+    def _generate_answer_from_result(
+        user_message: str,
+        previous_result: Dict[str, Any],
+        extracted_info: Dict[str, Any]
+    ) -> str:
+        """
+        쿼리 결과를 기반으로 자연스러운 한국어 답변을 생성합니다.
+
+        Args:
+            user_message: 사용자의 원본 메시지
+            previous_result: SQL 실행 결과 (columns, rows, row_count)
+            extracted_info: 추출된 엔티티 정보
+
+        Returns:
+            생성된 답변 문자열
+        """
+        try:
+            # 오류가 있으면 빈 답변 반환
+            if previous_result.get("error"):
+                return "조회 중 오류가 발생했습니다."
+
+            if not previous_result.get("rows"):
+                return "조회 결과가 없습니다."
+
+            # 첫 번째 행의 데이터 추출
+            row_data = previous_result["rows"][0]
+
+            # 사용자 메시지에서 측정 대상 파악
+            if "불량율" in user_message or "불량률" in user_message or "불량비" in user_message:
+                metric = "불량율"
+                unit = "%"
+                is_rate_query = True
+            elif "양품" in user_message or "좋은" in user_message:
+                metric = "양품"
+                unit = "개"
+                is_rate_query = False
+            elif "불량" in user_message or "불량품" in user_message:
+                metric = "불량품"
+                unit = "개"
+                is_rate_query = False
+            else:
+                metric = "생산량"
+                unit = "개"
+                is_rate_query = False
+
+            # 시간 표현 파악
+            if "__PERIOD__:past_week" in str(extracted_info.get("cycle_date", "")):
+                time_expr = "지난주"
+            elif "__PERIOD__:this_week" in str(extracted_info.get("cycle_date", "")):
+                time_expr = "이번주"
+            elif "__PERIOD__:past_month" in str(extracted_info.get("cycle_date", "")):
+                time_expr = "지난달"
+            elif "__PERIOD__:this_month" in str(extracted_info.get("cycle_date", "")):
+                time_expr = "이번달"
+            elif "어제" in user_message or "DATE_SUB" in str(extracted_info.get("cycle_date", "")):
+                time_expr = "어제"
+            elif "오늘" in user_message or "CURDATE" in str(extracted_info.get("cycle_date", "")):
+                time_expr = "오늘"
+            else:
+                time_expr = ""
+
+            # 쿼리 유형 판단: 숫자 조회 vs 텍스트 조회 (불량 원인 등)
+            is_text_query = (
+                "원인" in user_message or
+                "이유" in user_message or
+                "종류" in user_message
+            )
+
+            # 첫 번째 행의 데이터 추출
+            row_data = previous_result["rows"][0]
+
+            # 1. 텍스트 조회 (불량 원인 등)
+            if is_text_query:
+                rows = previous_result.get("rows", [])
+                if not rows:
+                    return "조회 결과가 없습니다."
+
+                # 기계 정보 추가
+                machine_id = extracted_info.get("machine_id", "")
+                machine_str = f"{machine_id}번 사출기의" if machine_id else "사출기의"
+
+                # 불량 원인별 개수가 있는지 확인
+                has_count = False
+                defect_counts = []
+
+                for row in rows:
+                    # defect_description과 count를 찾기
+                    defect_desc = None
+                    count = None
+
+                    for col_name, col_value in row.items():
+                        if col_name.lower() in ['defect_description', 'defect_desc']:
+                            defect_desc = col_value
+                        elif col_name.lower() == 'count':
+                            try:
+                                count = int(col_value)
+                                has_count = True
+                            except (ValueError, TypeError):
+                                pass
+
+                    if defect_desc:
+                        if has_count and count:
+                            defect_counts.append((defect_desc, count))
+                        else:
+                            defect_counts.append((defect_desc, None))
+
+                if not defect_counts:
+                    return "조회 결과가 없습니다."
+
+                # 괄호 안의 한글 부분만 추출 (예: "Flash (플래시)" → "플래시")
+                def extract_korean_name(desc):
+                    match = re.search(r'\(([^)]+)\)', desc)
+                    return match.group(1) if match else desc
+
+                # 텍스트 답변 구성
+                if has_count and all(count is not None for _, count in defect_counts):
+                    # 개수가 있는 경우: "플래시 3건, 보이드 2건"
+                    defect_details = []
+                    total_defects = sum(count for _, count in defect_counts)
+
+                    for desc, count in defect_counts:
+                        korean_name = extract_korean_name(desc)
+                        defect_details.append(f"{korean_name} {count}건")
+
+                    details_str = ", ".join(defect_details)
+                    answer = f"{time_expr} {machine_str} 불량 원인은 {details_str}이고, 총 {total_defects}건입니다."
+                else:
+                    # 개수가 없는 경우: "플래시, 보이드 등"
+                    unique_descs = [extract_korean_name(desc) for desc, _ in defect_counts]
+                    if len(unique_descs) == 1:
+                        answer = f"{time_expr} {machine_str} 불량 원인은 {unique_descs[0]}입니다."
+                    else:
+                        values_str = ", ".join(unique_descs)
+                        answer = f"{time_expr} {machine_str} 불량 원인은 {values_str} 등입니다."
+
+                return answer
+
+            # 2. 불량율 쿼리 (특별 처리)
+            if is_rate_query:
+                # 먼저 CTE 결과로 계산된 비교율이 있는지 확인 (yesterday_defects, yesterday_production, today_defects, today_production 등)
+                period_data = {}
+                for col_name, col_value in row_data.items():
+                    col_lower = col_name.lower()
+                    if col_value is not None:
+                        try:
+                            # yesterday_defects, yesterday_production, today_defects, today_production 등
+                            if 'yesterday' in col_lower and 'defect' in col_lower:
+                                if 'yesterday' not in period_data:
+                                    period_data['yesterday'] = {}
+                                period_data['yesterday']['defects'] = float(col_value)
+                            elif 'yesterday' in col_lower and ('production' in col_lower or 'cycle' in col_lower):
+                                if 'yesterday' not in period_data:
+                                    period_data['yesterday'] = {}
+                                period_data['yesterday']['production'] = float(col_value)
+                            elif 'today' in col_lower and 'defect' in col_lower:
+                                if 'today' not in period_data:
+                                    period_data['today'] = {}
+                                period_data['today']['defects'] = float(col_value)
+                            elif 'today' in col_lower and ('production' in col_lower or 'cycle' in col_lower):
+                                if 'today' not in period_data:
+                                    period_data['today'] = {}
+                                period_data['today']['production'] = float(col_value)
+                            # 지난주, 이번주, 지난달, 이번달도 동일하게 처리
+                            elif 'past_week' in col_lower or 'pastweek' in col_lower:
+                                if 'past_week' not in period_data:
+                                    period_data['past_week'] = {}
+                                if 'defect' in col_lower:
+                                    period_data['past_week']['defects'] = float(col_value)
+                                else:
+                                    period_data['past_week']['production'] = float(col_value)
+                            elif 'this_week' in col_lower or 'thisweek' in col_lower:
+                                if 'this_week' not in period_data:
+                                    period_data['this_week'] = {}
+                                if 'defect' in col_lower:
+                                    period_data['this_week']['defects'] = float(col_value)
+                                else:
+                                    period_data['this_week']['production'] = float(col_value)
+                            elif 'past_month' in col_lower or 'pastmonth' in col_lower:
+                                if 'past_month' not in period_data:
+                                    period_data['past_month'] = {}
+                                if 'defect' in col_lower:
+                                    period_data['past_month']['defects'] = float(col_value)
+                                else:
+                                    period_data['past_month']['production'] = float(col_value)
+                            elif 'this_month' in col_lower or 'thismonth' in col_lower:
+                                if 'this_month' not in period_data:
+                                    period_data['this_month'] = {}
+                                if 'defect' in col_lower:
+                                    period_data['this_month']['defects'] = float(col_value)
+                                else:
+                                    period_data['this_month']['production'] = float(col_value)
+                        except (ValueError, TypeError):
+                            pass
+
+                # CTE 결과 사용 (비교 쿼리) - 두 기간의 불량율 계산
+                period_pairs = [
+                    ('yesterday', '어제', 'today', '오늘'),
+                    ('past_week', '지난주', 'this_week', '이번주'),
+                    ('past_month', '지난달', 'this_month', '이번달'),
+                ]
+
+                for first_key, first_label, second_key, second_label in period_pairs:
+                    if (first_key in period_data and second_key in period_data and
+                        'defects' in period_data[first_key] and 'production' in period_data[first_key] and
+                        'defects' in period_data[second_key] and 'production' in period_data[second_key]):
+
+                        # 불량율 계산
+                        first_prod = period_data[first_key]['production']
+                        second_prod = period_data[second_key]['production']
+
+                        if first_prod > 0 and second_prod > 0:
+                            first_rate = (period_data[first_key]['defects'] / first_prod) * 100
+                            second_rate = (period_data[second_key]['defects'] / second_prod) * 100
+                            diff = second_rate - first_rate
+
+                            if diff > 0:
+                                change_str = f"({diff:.2f}%포인트 증가)"
+                            elif diff < 0:
+                                change_str = f"({abs(diff):.2f}%포인트 감소)"
+                            else:
+                                change_str = "(변화 없음)"
+
+                            answer = f"{first_label} 불량율은 {first_rate:.2f}%, {second_label} 불량율은 {second_rate:.2f}% {change_str}입니다."
+                            return answer
+
+                # CTE 결과 없으면 기존 로직 사용
+                total_defects = None
+                total_production = None
+
+                for col_name, col_value in row_data.items():
+                    col_lower = col_name.lower()
+                    if col_value is not None:
+                        try:
+                            if 'defect' in col_lower:
+                                total_defects = float(col_value)
+                            elif 'production' in col_lower or 'cycle' in col_lower:
+                                total_production = float(col_value)
+                        except (ValueError, TypeError):
+                            pass
+
+                if total_defects is None or total_production is None or total_production == 0:
+                    return "조회 결과를 처리할 수 없습니다."
+
+                # 불량율 계산
+                defect_rate = (total_defects / total_production) * 100
+
+                # 비교 쿼리인지 확인 (여러 행이 있는 경우 - UNION ALL 결과)
+                rows = previous_result.get("rows", [])
+                if len(rows) > 1:
+                    # 비교 쿼리: 모든 행의 불량율 계산
+                    rates = []
+                    period_labels = []
+
+                    # 사용자 메시지에서 기간 추출
+                    if "지난주" in user_message and "이번주" in user_message:
+                        period_labels = ["지난주", "이번주"]
+                    elif "지난달" in user_message and "이번달" in user_message:
+                        period_labels = ["지난달", "이번달"]
+                    elif "어제" in user_message and "오늘" in user_message:
+                        period_labels = ["어제", "오늘"]
+
+                    for row in rows:
+                        defects = None
+                        prod = None
+
+                        for col_name, col_value in row.items():
+                            col_lower = col_name.lower()
+                            if col_value is not None:
+                                if 'defect' in col_lower:
+                                    try:
+                                        defects = float(col_value)
+                                    except (ValueError, TypeError):
+                                        pass
+                                elif 'production' in col_lower or 'cycle' in col_lower:
+                                    try:
+                                        prod = float(col_value)
+                                    except (ValueError, TypeError):
+                                        pass
+
+                        if defects is not None and prod is not None and prod > 0:
+                            rate = (defects / prod) * 100
+                            rates.append(rate)
+
+                    if len(rates) == 2 and len(period_labels) == 2:
+                        # 두 기간 비교
+                        first_rate = rates[0]
+                        second_rate = rates[1]
+                        diff = second_rate - first_rate
+
+                        if diff > 0:
+                            change_str = f"({diff:.2f}%포인트 증가)"
+                        elif diff < 0:
+                            change_str = f"({abs(diff):.2f}%포인트 감소)"
+                        else:
+                            change_str = "(변화 없음)"
+
+                        answer = f"{period_labels[0]} 불량율은 {first_rate:.2f}%, {period_labels[1]} 불량율은 {second_rate:.2f}% {change_str}입니다."
+                        return answer
+                    elif rates:
+                        # 기간 레이블 없이 그냥 출력
+                        details_str = ", ".join(f"{rate:.2f}%" for rate in rates)
+                        answer = f"{details_str}입니다."
+                        return answer
+
+                # 단일 기간 쿼리
+                answer = f"{time_expr} 불량율은 {defect_rate:.2f}%입니다."
+                return answer
+
+            # 3. 숫자 조회 (생산량, 불량 개수 등)
+            value = None
+            for col_name, col_value in row_data.items():
+                if col_value is not None:
+                    try:
+                        # Decimal, int, float, numpy.int64 등 모든 숫자 타입 처리
+                        value = float(col_value)
+                        break
+                    except (ValueError, TypeError):
+                        continue
+
+            if value is None:
+                return "조회 결과를 처리할 수 없습니다."
+
+            # 숫자 포매팅 (천 단위 구분)
+            value_formatted = f"{int(value):,}"
+
+            # 답변 구성
+            if "__PERIOD__" in str(extracted_info.get("cycle_date", "")):
+                # 범위 쿼리 (총 키워드 포함)
+                answer = f"{time_expr} {metric}은 총 {value_formatted}{unit}입니다."
+            else:
+                # 단일 날짜 쿼리
+                answer = f"{time_expr} {metric}은 {value_formatted}{unit}입니다."
+
+            return answer
+
+        except Exception as e:
+            print(f"⚠️ 답변 생성 오류: {str(e)}")
+            return "답변을 생성할 수 없습니다."

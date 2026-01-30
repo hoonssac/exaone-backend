@@ -413,3 +413,95 @@ class SchemaRAGService:
             if col["name"] == column_name:
                 return col
         return None
+
+    @classmethod
+    def search_similar_schema(
+        cls,
+        db: Session,
+        query: str,
+        top_k: int = 5
+    ) -> Dict[str, Any]:
+        """
+        사용자 질문과 유사한 테이블과 컬럼을 함께 검색
+
+        Args:
+            db: SQLAlchemy Session
+            query: 사용자 질문
+            top_k: 반환할 결과 개수
+
+        Returns:
+            {
+                "tables": [테이블 검색 결과],
+                "columns": [컬럼 검색 결과]
+            }
+        """
+        try:
+            # 스키마 초기화 (필요시)
+            if not cls._fitted or not cls._schema_info:
+                cls.initialize_schema_embeddings(db)
+
+            # 테이블 검색
+            table_results = cls.search_similar_tables(query, top_k=3)
+
+            # 컬럼 검색
+            column_results = cls.search_similar_columns(query, top_k=top_k)
+
+            return {
+                "tables": table_results,
+                "columns": column_results
+            }
+        except Exception as e:
+            logger.error(f"Schema RAG 검색 오류: {str(e)}")
+            return {"tables": [], "columns": []}
+
+    @classmethod
+    def format_schema_hint(cls, schema_results: Dict[str, Any]) -> str:
+        """
+        Schema RAG 검색 결과를 프롬프트용 문자열로 포맷
+
+        Args:
+            schema_results: search_similar_schema() 반환값
+
+        Returns:
+            프롬프트에 추가할 문자열
+        """
+        try:
+            if not schema_results or (not schema_results.get("tables") and not schema_results.get("columns")):
+                return ""
+
+            hint = "## 추천 테이블/컬럼 (자동 검색)\n\n"
+
+            # 테이블 결과
+            tables = schema_results.get("tables", [])
+            if tables:
+                hint += "### 추천 테이블\n"
+                for table in tables[:3]:
+                    similarity = table.get("similarity", 0)
+                    hint += f"- **{table['table']}** (유사도: {similarity:.2f})\n"
+                    hint += f"  설명: {table['description']}\n"
+                    # 테이블 내 주요 컬럼들 표시
+                    cols = table.get("columns", [])[:3]
+                    if cols:
+                        hint += f"  컬럼: {', '.join([c['name'] for c in cols])}\n"
+                hint += "\n"
+
+            # 컬럼 결과
+            columns = schema_results.get("columns", [])
+            if columns:
+                hint += "### 추천 컬럼\n"
+                for col in columns[:5]:
+                    similarity = col.get("similarity", 0)
+                    table = col.get("table", "?")
+                    column = col.get("column", "?")
+                    desc = col.get("description", "N/A")
+                    hint += f"- **{table}.{column}** (유사도: {similarity:.2f})\n"
+                    hint += f"  타입: {col.get('type', 'unknown')}\n"
+                    hint += f"  설명: {desc}\n"
+                hint += "\n"
+
+            hint += "위의 추천 테이블/컬럼을 참고하여 SQL을 작성하세요.\n"
+
+            return hint
+        except Exception as e:
+            logger.error(f"Schema RAG 힌트 포맷 오류: {str(e)}")
+            return ""

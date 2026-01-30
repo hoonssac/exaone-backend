@@ -8,12 +8,203 @@ from dotenv import load_dotenv
 from app.models.user import User
 from app.models.chat import ChatThread, ChatMessage
 from app.models.prompt import PromptTable, PromptColumn, PromptDict, PromptKnowledge
-from app.models.admin import Term, Knowledge, SchemaField
+from app.models.admin import Term, Knowledge, SchemaField, FilterableField, AdminEntity
 from app.db.database import create_all_tables, test_postgres_connection, test_mysql_connection, PostgresSessionLocal
 from app.service.schema_rag_service import SchemaRAGService
 
 # 환경변수 로드
 load_dotenv()
+
+# FilterableField 초기화 함수
+def init_filterable_fields(db):
+    """FilterableField 초기 데이터 등록 및 업데이트"""
+    try:
+        # 사출기 필터
+        machine_filter = db.query(FilterableField).filter(
+            FilterableField.field_name == "machine_id"
+        ).first()
+
+        if not machine_filter:
+            machine_filter = FilterableField(
+                field_name="machine_id",
+                display_name="사출기",
+                description="사출 기계 ID",
+                field_type="numeric"
+            )
+            db.add(machine_filter)
+
+        # 항상 최신 설정으로 업데이트
+        # "1번", "1호", "사출기 1" 모두 처리
+        machine_filter.extraction_pattern = r"(\d+)\s*(?:번|호|호기)|(?:사출기|기계)\s*(\d+)"
+        machine_filter.extraction_keywords = [
+            "1번", "1호", "1호기", "사출기 1", "기계 1",
+            "2번", "2호", "2호기", "사출기 2", "기계 2",
+            "3번", "3호", "3호기", "사출기 3", "기계 3",
+            "4번", "4호", "4호기", "사출기 4", "기계 4",
+            "5번", "5호", "5호기", "사출기 5", "기계 5"
+        ]
+        machine_filter.value_mapping = None
+        machine_filter.is_optional = True
+        machine_filter.multiple_allowed = False
+        # valid_values는 관리자 API를 통해 동적으로 업데이트됨
+        if not machine_filter.valid_values:
+            machine_filter.valid_values = ["1", "2", "3", "4", "5"]
+        machine_filter.validation_type = "exact"
+
+        # 날짜 필터
+        date_filter = db.query(FilterableField).filter(
+            FilterableField.field_name == "cycle_date"
+        ).first()
+
+        if not date_filter:
+            date_filter = FilterableField(
+                field_name="cycle_date",
+                display_name="날짜",
+                description="사이클 실행 날짜",
+                field_type="date"
+            )
+            db.add(date_filter)
+
+        # 항상 최신 설정으로 업데이트
+        date_filter.extraction_pattern = r"\d{4}-\d{2}-\d{2}|\d{4}년\s*\d{1,2}월\s*\d{1,2}일"
+        date_filter.extraction_keywords = [
+            "오늘", "어제", "내일", "지난주", "이번주",
+            "지난달", "이번달", "모레", "그저께"
+        ]
+        date_filter.value_mapping = {
+            "오늘": "CURDATE()",
+            "어제": "DATE_SUB(CURDATE(), INTERVAL 1 DAY)",
+            "내일": "DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+            "모레": "DATE_ADD(CURDATE(), INTERVAL 1 DAY)",
+            "그저께": "DATE_SUB(CURDATE(), INTERVAL 2 DAY)",
+            # 범위 표현은 Agent가 직접 처리 (단일 날짜 아님)
+            "지난주": "__PERIOD__:past_week",
+            "이번주": "__PERIOD__:this_week",
+            "지난달": "__PERIOD__:past_month",
+            "이번달": "__PERIOD__:this_month",
+        }
+        date_filter.is_optional = True
+        date_filter.multiple_allowed = False
+
+        # 금형 필터
+        mold_filter = db.query(FilterableField).filter(
+            FilterableField.field_name == "mold_id"
+        ).first()
+
+        if not mold_filter:
+            mold_filter = FilterableField(
+                field_name="mold_id",
+                display_name="금형",
+                description="사용된 금형 ID",
+                field_type="numeric"
+            )
+            db.add(mold_filter)
+
+        # 항상 최신 설정으로 업데이트
+        # "DC1", "DC2", "금형 1" 형식 모두 처리
+        mold_filter.extraction_pattern = r"(?:DC|금형)\s*(\d+)"
+        mold_filter.extraction_keywords = ["DC", "금형"]
+        mold_filter.value_mapping = None
+        mold_filter.is_optional = True
+        mold_filter.multiple_allowed = True
+        mold_filter.valid_values = ["1"]  # 유효한 금형 ID
+        mold_filter.validation_type = "exact"
+
+        # 재료 필터
+        material_filter = db.query(FilterableField).filter(
+            FilterableField.field_name == "material_id"
+        ).first()
+
+        if not material_filter:
+            material_filter = FilterableField(
+                field_name="material_id",
+                display_name="재료",
+                description="원재료 ID",
+                field_type="numeric"
+            )
+            db.add(material_filter)
+
+        # 항상 최신 설정으로 업데이트
+        # "HIPS1", "PP2", "재료 1" 형식 모두 처리
+        material_filter.extraction_pattern = r"(?:재료|HIPS|PP)\s*(\d+)"
+        material_filter.extraction_keywords = ["HIPS", "PP", "재료"]
+        material_filter.value_mapping = None
+        material_filter.is_optional = True
+        material_filter.multiple_allowed = True
+        material_filter.valid_values = ["1"]  # 유효한 재료 ID
+        material_filter.validation_type = "exact"
+
+        db.commit()
+        print("✅ FilterableField 데이터 업데이트 완료")
+    except Exception as e:
+        print(f"⚠️ FilterableField 초기화 오류: {str(e)}")
+        db.rollback()
+
+
+# AdminEntity 초기화 함수
+def init_admin_entities(db):
+    """AdminEntity 초기 데이터 등록 및 업데이트"""
+    try:
+        print("🔄 AdminEntity 초기화 중...")
+
+        entities_config = [
+            {
+                "entity_name": "machines",
+                "display_name": "사출기",
+                "description": "사용 가능한 사출 기계 목록",
+                "db_type": "mysql",
+                "table_name": "injection_molding_machine",
+                "id_column": "id",
+                "name_column": "equipment_name",
+                "query": "SELECT id, equipment_name as name FROM injection_molding_machine WHERE deleted_at IS NULL ORDER BY id",
+            },
+            {
+                "entity_name": "materials",
+                "display_name": "재료",
+                "description": "사용 가능한 원재료 목록",
+                "db_type": "mysql",
+                "table_name": "material_spec",
+                "id_column": "id",
+                "name_column": "material_type",
+                "query": "SELECT id, material_type as name FROM material_spec WHERE deleted_at IS NULL ORDER BY id",
+            },
+            {
+                "entity_name": "molds",
+                "display_name": "금형",
+                "description": "사용 가능한 금형 목록",
+                "db_type": "mysql",
+                "table_name": "mold_info",
+                "id_column": "id",
+                "name_column": "mold_name",
+                "query": "SELECT id, mold_name as name FROM mold_info WHERE deleted_at IS NULL ORDER BY id",
+            },
+        ]
+
+        for config in entities_config:
+            # 기존 엔티티 조회
+            existing = db.query(AdminEntity).filter(
+                AdminEntity.entity_name == config["entity_name"]
+            ).first()
+
+            if existing:
+                # 기존 엔티티 업데이트
+                for key, value in config.items():
+                    if key != "entity_name":
+                        setattr(existing, key, value)
+                print(f"✅ {config['display_name']} 엔티티 업데이트")
+            else:
+                # 새 엔티티 생성
+                new_entity = AdminEntity(**config)
+                db.add(new_entity)
+                print(f"✅ {config['display_name']} 엔티티 생성")
+
+        db.commit()
+        print("✅ AdminEntity 초기화 완료")
+
+    except Exception as e:
+        db.rollback()
+        print(f"⚠️ AdminEntity 초기화 오류: {str(e)}")
+
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -53,6 +244,37 @@ async def startup_event():
     if postgres_ok:
         # 테이블 생성
         create_all_tables()
+
+        # 마이그레이션 실행
+        try:
+            import sys
+            from pathlib import Path
+            migrations_path = Path(__file__).parent.parent / "migrations"
+            sys.path.insert(0, str(migrations_path))
+
+            from migration_001_add_valid_values_to_filterable_fields import migrate_up as migrate_001
+            from migration_002_add_admin_entities import migrate_up as migrate_002
+
+            migrate_001()
+            migrate_002()
+        except Exception as e:
+            print(f"⚠️ 마이그레이션 실행 중 오류: {str(e)}")
+
+        # FilterableField 초기 데이터 등록
+        try:
+            db = PostgresSessionLocal()
+            init_filterable_fields(db)
+            db.close()
+        except Exception as e:
+            print(f"⚠️ FilterableField 초기화 오류: {str(e)}")
+
+        # AdminEntity 초기 데이터 등록
+        try:
+            db = PostgresSessionLocal()
+            init_admin_entities(db)
+            db.close()
+        except Exception as e:
+            print(f"⚠️ AdminEntity 초기화 오류: {str(e)}")
 
         # 스키마 임베딩 초기화 (Schema-based RAG)
         try:

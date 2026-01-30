@@ -1,7 +1,7 @@
 """
 관리자 API 라우트
 
-용어 사전, 도메인 지식, 필드 설명을 관리하는 API입니다.
+용어 사전, 도메인 지식, 필드 설명, 필터 규칙을 관리하는 API입니다.
 
 엔드포인트:
 - GET /api/v1/admin/terms: 모든 용어 조회
@@ -14,25 +14,43 @@
 - DELETE /api/v1/admin/knowledge/{id}: 지식 삭제
 - GET /api/v1/admin/schema: 모든 필드 설명 조회
 - PUT /api/v1/admin/schema/{id}: 필드 설명 수정
+- GET /api/v1/admin/filters: 모든 필터 규칙 조회
+- POST /api/v1/admin/filters: 새 필터 규칙 추가
+- GET /api/v1/admin/filters/{id}: 특정 필터 규칙 조회
+- PUT /api/v1/admin/filters/{id}: 필터 규칙 수정
+- DELETE /api/v1/admin/filters/{id}: 필터 규칙 삭제
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from datetime import datetime
+import os
 
 from app.db.database import get_postgres_db
 from app.schemas.auth import ErrorResponse
+from app.schemas.admin import (
+    FilterableFieldCreate, FilterableFieldUpdate,
+    FilterableFieldResponse, FilterableFieldListResponse
+)
+from app.service.admin_service import AdminService
 from app.config.security import verify_token
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin Management"])
+
+# 개발 환경에서는 인증 스킵
+SKIP_AUTH = os.getenv("SKIP_AUTH", "false").lower() == "true"
 
 
 def get_current_user_id(authorization: Optional[str] = Header(None)) -> int:
     """
     현재 사용자 ID 추출
     Authorization 헤더에서 Bearer 토큰을 받아 사용자 ID를 반환합니다.
+    개발 환경(SKIP_AUTH=true)에서는 토큰 검증을 건너뜁니다.
     """
+    if SKIP_AUTH:
+        return 0  # 개발 환경에서는 더미 사용자 ID 반환
+
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -500,4 +518,261 @@ def update_schema_field(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"필드 수정 오류: {str(e)}"
+        )
+
+
+# ============= 필터 규칙 (FilterableField) =============
+
+@router.get("/filters", tags=["Filters"])
+def get_all_filters(
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_postgres_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    모든 필터 규칙 조회
+    """
+    try:
+        fields, total = AdminService.get_all_filterable_fields(db, skip=skip, limit=limit)
+        
+        return {
+            "success": True,
+            "total": total,
+            "data": [
+                {
+                    "id": field.id,
+                    "field_name": field.field_name,
+                    "display_name": field.display_name,
+                    "description": field.description,
+                    "field_type": field.field_type,
+                    "extraction_pattern": field.extraction_pattern,
+                    "extraction_keywords": field.extraction_keywords,
+                    "value_mapping": field.value_mapping,
+                    "is_optional": field.is_optional,
+                    "multiple_allowed": field.multiple_allowed,
+                    "valid_values": field.valid_values,
+                    "validation_type": field.validation_type,
+                }
+                for field in fields
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"필터 조회 오류: {str(e)}"
+        )
+
+
+@router.get("/filters/{filter_id}", tags=["Filters"])
+def get_filter(
+    filter_id: int,
+    db: Session = Depends(get_postgres_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    특정 필터 규칙 조회
+    """
+    try:
+        field = AdminService.get_filterable_field_by_id(db, filter_id)
+        
+        if not field:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="필터를 찾을 수 없습니다"
+            )
+        
+        return {
+            "success": True,
+            "data": {
+                "id": field.id,
+                "field_name": field.field_name,
+                "display_name": field.display_name,
+                "description": field.description,
+                "field_type": field.field_type,
+                "extraction_pattern": field.extraction_pattern,
+                "extraction_keywords": field.extraction_keywords,
+                "value_mapping": field.value_mapping,
+                "is_optional": field.is_optional,
+                "multiple_allowed": field.multiple_allowed,
+                "valid_values": field.valid_values,
+                "validation_type": field.validation_type,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"필터 조회 오류: {str(e)}"
+        )
+
+
+@router.post("/filters", tags=["Filters"])
+def create_filter(
+    payload: FilterableFieldCreate,
+    db: Session = Depends(get_postgres_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    새 필터 규칙 추가
+    """
+    try:
+        # 데이터 검증
+        is_valid, error_msg = AdminService.validate_filterable_field(
+            payload.field_type,
+            payload.extraction_pattern,
+            payload.extraction_keywords
+        )
+        
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_msg
+            )
+        
+        # 필터 생성
+        field = AdminService.create_filterable_field(
+            db=db,
+            field_name=payload.field_name,
+            display_name=payload.display_name,
+            field_type=payload.field_type,
+            extraction_pattern=payload.extraction_pattern,
+            extraction_keywords=payload.extraction_keywords,
+            value_mapping=payload.value_mapping,
+            description=payload.description,
+            is_optional=payload.is_optional,
+            multiple_allowed=payload.multiple_allowed
+        )
+        
+        return {
+            "success": True,
+            "data": {
+                "id": field.id,
+                "field_name": field.field_name,
+                "display_name": field.display_name,
+                "description": field.description,
+                "field_type": field.field_type,
+                "extraction_pattern": field.extraction_pattern,
+                "extraction_keywords": field.extraction_keywords,
+                "value_mapping": field.value_mapping,
+                "is_optional": field.is_optional,
+                "multiple_allowed": field.multiple_allowed,
+                "valid_values": field.valid_values,
+                "validation_type": field.validation_type,
+            }
+        }
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"필터 생성 오류: {str(e)}"
+        )
+
+
+@router.put("/filters/{filter_id}", tags=["Filters"])
+def update_filter(
+    filter_id: int,
+    payload: FilterableFieldUpdate,
+    db: Session = Depends(get_postgres_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    필터 규칙 수정
+    """
+    try:
+        # 필드 타입이 변경되는 경우 검증
+        if payload.field_type:
+            is_valid, error_msg = AdminService.validate_filterable_field(
+                payload.field_type,
+                payload.extraction_pattern,
+                payload.extraction_keywords
+            )
+            
+            if not is_valid:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=error_msg
+                )
+        
+        # 업데이트할 필드들만 추출
+        update_data = {}
+        for key, value in payload.dict(exclude_unset=True).items():
+            update_data[key] = value
+        
+        # 필터 업데이트
+        field = AdminService.update_filterable_field(db, filter_id, **update_data)
+        
+        return {
+            "success": True,
+            "data": {
+                "id": field.id,
+                "field_name": field.field_name,
+                "display_name": field.display_name,
+                "description": field.description,
+                "field_type": field.field_type,
+                "extraction_pattern": field.extraction_pattern,
+                "extraction_keywords": field.extraction_keywords,
+                "value_mapping": field.value_mapping,
+                "is_optional": field.is_optional,
+                "multiple_allowed": field.multiple_allowed,
+                "valid_values": field.valid_values,
+                "validation_type": field.validation_type,
+            }
+        }
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(ve)
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"필터 수정 오류: {str(e)}"
+        )
+
+
+@router.delete("/filters/{filter_id}", tags=["Filters"])
+def delete_filter(
+    filter_id: int,
+    db: Session = Depends(get_postgres_db),
+    current_user_id: int = Depends(get_current_user_id),
+):
+    """
+    필터 규칙 삭제
+    """
+    try:
+        field = AdminService.get_filterable_field_by_id(db, filter_id)
+        
+        if not field:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="필터를 찾을 수 없습니다"
+            )
+        
+        AdminService.delete_filterable_field(db, filter_id)
+        
+        return {"success": True, "message": "필터가 삭제되었습니다"}
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(ve)
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"필터 삭제 오류: {str(e)}"
         )
