@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import os
 from dotenv import load_dotenv
+import time
 
 # 모델 import (테이블 생성을 위해 필요)
 from app.models.user import User
@@ -15,10 +17,46 @@ from app.service.schema_rag_service import SchemaRAGService
 # 환경변수 로드
 load_dotenv()
 
+
+# 모든 HTTP 요청 로깅 미들웨어
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # 요청 정보 로깅
+        method = request.method
+        path = request.url.path
+        query = request.url.query
+        client = request.client.host if request.client else "unknown"
+
+        print(f"\n📨 HTTP 요청 수신:")
+        print(f"   클라이언트: {client}")
+        print(f"   메서드: {method} {path}")
+        if query:
+            print(f"   쿼리: {query}")
+
+        start_time = time.time()
+
+        try:
+            response = await call_next(request)
+            elapsed = time.time() - start_time
+            print(f"   상태: {response.status_code} ({elapsed:.2f}초)")
+            return response
+        except Exception as e:
+            elapsed = time.time() - start_time
+            print(f"   ❌ 오류: {str(e)[:100]} ({elapsed:.2f}초)")
+            raise
+
+
 # FilterableField 초기화 함수
 def init_filterable_fields(db):
     """FilterableField 초기 데이터 등록 및 업데이트"""
     try:
+        # FilterableField 테이블 존재 확인
+        try:
+            db.query(FilterableField).first()
+        except Exception as e:
+            print(f"⚠️ FilterableField 테이블 없음 (테이블 생성 필요): {str(e)[:50]}")
+            return
+
         # 사출기 필터
         machine_filter = db.query(FilterableField).filter(
             FilterableField.field_name == "machine_id"
@@ -145,6 +183,13 @@ def init_filterable_fields(db):
 def init_admin_entities(db):
     """AdminEntity 초기 데이터 등록 및 업데이트"""
     try:
+        # AdminEntity 테이블 존재 확인
+        try:
+            db.query(AdminEntity).first()
+        except Exception as e:
+            print(f"⚠️ AdminEntity 테이블 없음 (테이블 생성 필요): {str(e)[:50]}")
+            return
+
         print("🔄 AdminEntity 초기화 중...")
 
         entities_config = [
@@ -213,6 +258,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# 요청 로깅 미들웨어 추가 (CORS 전에)
+app.add_middleware(RequestLoggingMiddleware)
+
 # CORS 설정
 CORS_ORIGINS = [
     "http://localhost:8080",
@@ -237,65 +285,98 @@ async def startup_event():
     """애플리케이션 시작 시 실행"""
     print("🚀 EXAONE API 서버 시작...")
 
-    # 데이터베이스 연결 테스트
-    postgres_ok = test_postgres_connection()
-    mysql_ok = test_mysql_connection()
+    try:
+        # 데이터베이스 연결 테스트
+        postgres_ok = test_postgres_connection()
+        mysql_ok = test_mysql_connection()
 
-    if postgres_ok:
+        if not postgres_ok:
+            print("❌ PostgreSQL 연결 실패 - 테이블을 생성할 수 없습니다")
+            return
+
         # 테이블 생성
-        create_all_tables()
+        try:
+            create_all_tables()
+            print("✅ 테이블 생성 완료")
+        except Exception as e:
+            print(f"⚠️ 테이블 생성 오류: {str(e)}")
 
-        # 마이그레이션 실행
+        # 마이그레이션 실행 (실패해도 계속 진행)
         try:
             import sys
             from pathlib import Path
             migrations_path = Path(__file__).parent.parent / "migrations"
+
+            # 기존 경로 제거 후 추가 (중복 방지)
+            if str(migrations_path) in sys.path:
+                sys.path.remove(str(migrations_path))
             sys.path.insert(0, str(migrations_path))
 
+            print("🔄 마이그레이션 001 실행 중...")
             from migration_001_add_valid_values_to_filterable_fields import migrate_up as migrate_001
-            from migration_002_add_admin_entities import migrate_up as migrate_002
-
             migrate_001()
+            print("✅ 마이그레이션 001 완료")
+
+            print("🔄 마이그레이션 002 실행 중...")
+            from migration_002_add_admin_entities import migrate_up as migrate_002
             migrate_002()
+            print("✅ 마이그레이션 002 완료")
+        except ImportError as e:
+            print(f"⚠️ 마이그레이션 import 실패 (무시함): {str(e)}")
         except Exception as e:
-            print(f"⚠️ 마이그레이션 실행 중 오류: {str(e)}")
+            print(f"⚠️ 마이그레이션 실행 중 오류 (무시함): {str(e)}")
 
         # FilterableField 초기 데이터 등록
         try:
+            print("🔄 FilterableField 초기화 중...")
             db = PostgresSessionLocal()
-            init_filterable_fields(db)
-            db.close()
+            try:
+                init_filterable_fields(db)
+                print("✅ FilterableField 초기화 완료")
+            finally:
+                db.rollback()
+                db.close()
         except Exception as e:
             print(f"⚠️ FilterableField 초기화 오류: {str(e)}")
 
         # AdminEntity 초기 데이터 등록
         try:
+            print("🔄 AdminEntity 초기화 중...")
             db = PostgresSessionLocal()
-            init_admin_entities(db)
-            db.close()
+            try:
+                init_admin_entities(db)
+                print("✅ AdminEntity 초기화 완료")
+            finally:
+                db.rollback()
+                db.close()
         except Exception as e:
             print(f"⚠️ AdminEntity 초기화 오류: {str(e)}")
 
-        # 스키마 임베딩 초기화 (Schema-based RAG)
+        # 스키마 임베딩 초기화 (Schema-based RAG) - 실패해도 무시
         try:
+            print("🔄 스키마 임베딩 초기화 중...")
             db = PostgresSessionLocal()
             SchemaRAGService.initialize_schema_embeddings(db)
             db.close()
             print("✅ 스키마 임베딩 초기화 완료")
         except Exception as e:
-            print(f"⚠️ 스키마 임베딩 초기화 오류: {str(e)}")
+            print(f"⚠️ 스키마 임베딩 초기화 오류 (무시함): {str(e)}")
 
-        # Supertonic TTS 초기화
+        # Supertonic TTS 초기화 - 실패해도 무시
         try:
+            print("🔄 Supertonic TTS 초기화 중...")
             from app.service.supertonic_service import SupertonicService
             SupertonicService.initialize()
             print("✅ Supertonic TTS 초기화 완료")
         except Exception as e:
-            print(f"⚠️ Supertonic TTS 초기화 오류: {str(e)}")
+            print(f"⚠️ Supertonic TTS 초기화 오류 (무시함): {str(e)}")
 
-        print("✅ 모든 시작 절차 완료")
-    else:
-        print("❌ PostgreSQL 연결 실패 - 테이블을 생성할 수 없습니다")
+        print("✅ 모든 시작 절차 완료 (일부 오류는 무시됨)")
+
+    except Exception as e:
+        print(f"❌ startup_event 중 치명적 오류: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 # 헬스체크 엔드포인트
 @app.get("/health")
@@ -309,6 +390,39 @@ async def health_check():
         "postgresql": "connected" if postgres_ok else "disconnected",
         "mysql": "connected" if mysql_ok else "disconnected"
     }
+
+
+# 데이터베이스 연결 풀 상태 확인 (디버깅용)
+@app.get("/debug/db-pool-status")
+async def db_pool_status():
+    """데이터베이스 연결 풀 상태 확인"""
+    from app.db.database import postgres_engine, mysql_engine
+
+    try:
+        pg_pool = postgres_engine.pool
+        mysql_pool = mysql_engine.pool
+
+        return {
+            "postgresql": {
+                "pool_size": pg_pool.size(),
+                "checked_out": pg_pool.checkedout(),
+                "overflow": pg_pool.overflow(),
+                "total": pg_pool.size() + pg_pool.overflow(),
+                "checked_in": pg_pool.checkedin(),
+            },
+            "mysql": {
+                "pool_size": mysql_pool.size(),
+                "checked_out": mysql_pool.checkedout(),
+                "overflow": mysql_pool.overflow(),
+                "total": mysql_pool.size() + mysql_pool.overflow(),
+                "checked_in": mysql_pool.checkedin(),
+            }
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "message": "연결 풀 상태를 조회할 수 없습니다"
+        }
 
 # 메인 엔드포인트
 @app.get("/")

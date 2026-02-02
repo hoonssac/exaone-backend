@@ -373,14 +373,65 @@ class QueryService:
                 available_entities={},
                 previous_result=None,
                 iteration=0,
-                max_iterations=5,
+                max_iterations=3,  # 최대 반복 횟수 감소 (5 → 3)
                 conversation_history=conversation_history,
             )
 
-            # 에이전트 루프
+            # 에이전트 루프 (타임아웃 적용)
+            AGENT_TIMEOUT = 30  # 30초 타임아웃
+            loop_start_time = time.time()
+
             while context.iteration < context.max_iterations:
+                # 타임아웃 확인
+                elapsed_time = time.time() - loop_start_time
+                if elapsed_time > AGENT_TIMEOUT:
+                    print(f"⏱️ 에이전트 루프 타임아웃 ({elapsed_time:.1f}초 초과)")
+                    # 이전 결과가 있으면 반환, 없으면 에러
+                    if context.previous_result and context.previous_result.get("row_count", 0) > 0:
+                        print(f"→ 타임아웃되었지만 이미 조회 결과가 있으므로 반환")
+                        answer_text = QueryService._generate_answer_from_result(
+                            context.user_message,
+                            context.previous_result,
+                            context.extracted_info
+                        )
+                    else:
+                        print(f"→ 타임아웃되고 조회 결과 없음")
+                        answer_text = "처리 시간이 초과되었습니다. 질문을 단순화하거나 다시 시도해주세요."
+
+                    # 메시지 저장 후 반환
+                    user_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="user",
+                        message=request.message,
+                        context_tag=request.context_tag,
+                    )
+                    db_postgres.add(user_msg)
+                    db_postgres.flush()
+
+                    assistant_msg = ChatMessage(
+                        thread_id=thread.id,
+                        role="assistant",
+                        message=answer_text,
+                    )
+                    db_postgres.add(assistant_msg)
+                    db_postgres.commit()
+
+                    execution_time = (time.time() - start_time) * 1000
+                    response = QueryResponse(
+                        thread_id=thread.id,
+                        message_id=None,
+                        original_message=request.message,
+                        corrected_message=request.message,
+                        generated_sql=None,
+                        result_data=context.previous_result if context.previous_result else None,
+                        execution_time=execution_time,
+                        natural_response=answer_text,
+                        created_at=datetime.now()
+                    )
+                    return response
+
                 context.iteration += 1
-                print(f"\n[에이전트 반복 {context.iteration}/{context.max_iterations}]")
+                print(f"\n[에이전트 반복 {context.iteration}/{context.max_iterations}] (경과 시간: {elapsed_time:.1f}초)")
 
                 # 2번째 반복 이상이고 이미 결과가 있으면 answer 반환 (쿼리 반복 방지)
                 if context.iteration >= 2 and context.previous_result and context.previous_result.get("row_count", 0) > 0:
@@ -454,8 +505,39 @@ class QueryService:
                         print(f"✅ SQL 실행 완료: {len(rows)}개 행")
                     except Exception as e:
                         print(f"❌ SQL 실행 오류: {str(e)}")
-                        context.previous_result = {"error": str(e)}
-                    continue
+                        # 오류 후 루프 탈출 (무한 반복 방지)
+                        error_msg = f"쿼리 실행 중 오류가 발생했습니다: {str(e)[:100]}"
+
+                        user_msg = ChatMessage(
+                            thread_id=thread.id,
+                            role="user",
+                            message=request.message,
+                            context_tag=request.context_tag,
+                        )
+                        db_postgres.add(user_msg)
+                        db_postgres.flush()
+
+                        assistant_msg = ChatMessage(
+                            thread_id=thread.id,
+                            role="assistant",
+                            message=error_msg,
+                        )
+                        db_postgres.add(assistant_msg)
+                        db_postgres.commit()
+
+                        execution_time = (time.time() - start_time) * 1000
+                        response = QueryResponse(
+                            thread_id=thread.id,
+                            message_id=None,
+                            original_message=request.message,
+                            corrected_message=request.message,
+                            generated_sql=agent_response.sql,
+                            result_data=None,
+                            execution_time=execution_time,
+                            natural_response=error_msg,
+                            created_at=datetime.now()
+                        )
+                        return response
 
                 elif agent_response.action == AgentAction.ASK_CLARIFICATION:
                     print(f"→ 사용자에게 재질문")

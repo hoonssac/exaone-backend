@@ -19,16 +19,30 @@ MYSQL_URL = os.getenv(
 # PostgreSQL 엔진 (앱 데이터)
 postgres_engine = create_engine(
     DATABASE_URL,
-    echo=True,  # SQL 로그 출력 (디버깅용)
+    echo=False,  # 프로덕션에서는 비활성화 (성능 개선)
+    pool_size=10,  # 동시 연결 수 (너무 크면 DB 과부하)
+    max_overflow=5,  # 추가 연결 (제한적)
     pool_pre_ping=True,  # 연결 풀 재시작 전 연결 테스트
+    pool_recycle=1800,  # 30분마다 연결 재활성화 (더 자주)
+    connect_args={
+        "connect_timeout": 10,  # 연결 타임아웃 10초
+        "keepalives": 1,  # TCP keepalive 활성화
+        "keepalives_idle": 30,
+    },
 )
 
 # MySQL 엔진 (제조 데이터)
 mysql_engine = create_engine(
     MYSQL_URL,
-    echo=True,
+    echo=False,  # 프로덕션에서는 비활성화
+    pool_size=10,
+    max_overflow=5,
     pool_pre_ping=True,
-    connect_args={"charset": "utf8mb4"},
+    pool_recycle=1800,
+    connect_args={
+        "charset": "utf8mb4",
+        "connect_timeout": 10,
+    },
 )
 
 # 세션 설정
@@ -53,9 +67,31 @@ def get_postgres_db() -> Generator[Session, None, None]:
     """PostgreSQL 데이터베이스 세션 반환"""
     db = PostgresSessionLocal()
     try:
+        # 연결 풀 상태 로깅 (디버깅용)
+        pool = postgres_engine.pool
+        checked_out = pool.checkedout()
+        size = pool.size()
+        if checked_out > size * 0.8:  # 80% 이상 사용 중
+            print(f"⚠️ PostgreSQL 연결 풀 사용률 높음: {checked_out}/{size}")
+
         yield db
+    except Exception as e:
+        print(f"⚠️ PostgreSQL 세션 오류: {str(e)[:100]}")
+        try:
+            db.rollback()
+        except:
+            pass
+        raise
     finally:
-        db.close()
+        # 명시적으로 롤백 후 닫기
+        try:
+            db.rollback()
+        except:
+            pass
+        try:
+            db.close()
+        except Exception as e:
+            print(f"⚠️ PostgreSQL 세션 닫기 오류: {str(e)[:50]}")
 
 
 # 의존성: MySQL 세션
@@ -63,9 +99,31 @@ def get_mysql_db() -> Generator[Session, None, None]:
     """MySQL 데이터베이스 세션 반환"""
     db = MysqlSessionLocal()
     try:
+        # 연결 풀 상태 로깅 (디버깅용)
+        pool = mysql_engine.pool
+        checked_out = pool.checkedout()
+        size = pool.size()
+        if checked_out > size * 0.8:  # 80% 이상 사용 중
+            print(f"⚠️ MySQL 연결 풀 사용률 높음: {checked_out}/{size}")
+
         yield db
+    except Exception as e:
+        print(f"⚠️ MySQL 세션 오류: {str(e)[:100]}")
+        try:
+            db.rollback()
+        except:
+            pass
+        raise
     finally:
-        db.close()
+        # 명시적으로 롤백 후 닫기
+        try:
+            db.rollback()
+        except:
+            pass
+        try:
+            db.close()
+        except Exception as e:
+            print(f"⚠️ MySQL 세션 닫기 오류: {str(e)[:50]}")
 
 
 # 데이터베이스 테이블 생성

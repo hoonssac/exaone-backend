@@ -60,6 +60,7 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> int:
     responses={
         401: {"model": ErrorResponse, "description": "이메일 또는 비밀번호 오류"},
         400: {"model": ErrorResponse, "description": "요청 데이터 오류"},
+        500: {"model": ErrorResponse, "description": "서버 오류"},
     },
 )
 async def login(
@@ -78,15 +79,42 @@ async def login(
     - user: 사용자 정보
     """
     try:
+        # 입력 검증
+        if not request.email or not request.password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="이메일과 비밀번호는 필수입니다",
+            )
+
+        print(f"🔐 로그인 시도: {request.email}")
+
         response = AuthService.login(db, request)
+        print(f"✅ 로그인 성공: {request.email}")
         return response
+
+    except HTTPException:
+        raise
+
     except ValueError as e:
+        error_msg = str(e)
+        print(f"⚠️ 로그인 검증 오류: {error_msg}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e),
+            detail=error_msg,
         )
+
     except Exception as e:
-        print(f"❌ 로그인 오류: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ 로그인 오류: {error_msg}")
+        print(f"   오류 타입: {type(e).__name__}")
+
+        # 데이터베이스 연결 오류
+        if "psycopg2" in error_msg or "connection" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="데이터베이스 연결 오류가 발생했습니다",
+            )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="로그인 중 오류가 발생했습니다",
@@ -100,6 +128,7 @@ async def login(
     responses={
         409: {"model": ErrorResponse, "description": "이메일 또는 사원ID 중복"},
         400: {"model": ErrorResponse, "description": "요청 데이터 오류"},
+        500: {"model": ErrorResponse, "description": "서버 오류"},
     },
 )
 async def signup(
@@ -122,10 +151,16 @@ async def signup(
     - user: 사용자 정보
     """
     try:
+        print(f"📝 회원가입 시도: {request.email}")
+
         response = AuthService.signup(db, request)
+        print(f"✅ 회원가입 성공: {request.email}")
         return response
+
     except ValueError as e:
         error_msg = str(e)
+        print(f"⚠️ 회원가입 검증 오류: {error_msg}")
+
         # 이메일 중복 또는 사원ID 중복의 경우 409 Conflict
         if "이미 존재하는" in error_msg:
             raise HTTPException(
@@ -137,8 +172,19 @@ async def signup(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=error_msg,
             )
+
     except Exception as e:
-        print(f"❌ 회원가입 오류: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ 회원가입 오류: {error_msg}")
+        print(f"   오류 타입: {type(e).__name__}")
+
+        # 데이터베이스 연결 오류
+        if "psycopg2" in error_msg or "connection" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="데이터베이스 연결 오류가 발생했습니다",
+            )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="회원가입 중 오류가 발생했습니다",
